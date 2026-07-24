@@ -1,6 +1,6 @@
 # LDR-Seller-Finder
 
-Seller lead generation system for Lifestyle Design Realty. Every week it pulls public property and court data for the San Antonio metro (Bexar and Comal counties), identifies homeowners who are statistically likely to sell, scores them, skip-traces the qualified ones for contact information, and stages them for **your manual approval** before anything is pushed to Follow Up Boss.
+Seller lead generation system for Lifestyle Design Realty. Every week it pulls public property and court data for the San Antonio metro (Bexar and Comal counties), identifies homeowners who are statistically likely to sell, scores them, skip-traces the qualified ones for contact information, and **auto-pushes contactable leads straight into Follow Up Boss** at the end of the Monday run — tagged, deduped, and annotated. Leads with no email and no phone are held (never pushed), and DNC/litigator-flagged owners carry a `DNC` tag so the nurture system suppresses texting/calling.
 
 **This repo finds and stages leads. It never contacts them.** All outreach (emails, texts, campaigns) stays in [LDR-Automation-Clean](https://github.com/PropertyPete1/LDR-Automation-Clean), which handles CAN-SPAM compliance, unsubscribe handling, and send-time rules.
 
@@ -21,17 +21,21 @@ Seller lead generation system for Lifestyle Design Realty. Every week it pulls p
                                               budget-capped, never re-billed)
                                                            │
                                                            ▼
-                                          Staged as "awaiting_approval"
-                                          + review CSV artifact + digest email
-                                                           │
-                                     ═════ YOU REVIEW & APPROVE (manual) ═════
-                                                           │
-                                                           ▼
-                 ┌────────────────────────────────────────────────┐
-                 │   Push Approved Leads (manual trigger only)    │
-                 │   → Follow Up Boss with tags + notes, deduped  │
-                 └────────────────────────────────────────────────┘
+                                       Contactable (email or phone found)?
+                                        │ yes                    │ no
+                                        ▼                        ▼
+                 ┌──────────────────────────────┐      HELD (never pushed)
+                 │ AUTO-PUSH → Follow Up Boss   │      status=held_no_contact
+                 │ tags + notes, deduped;       │
+                 │ DNC tag for flagged owners   │
+                 └──────────────────────────────┘
+                                        │
+                                        ▼
+                    pending_leads.csv artifact (push record)
+                    + run summary + digest email
 ```
+
+The **Push Approved Leads** workflow still exists as a manual fallback: it retries leads that failed to push and re-checks held leads for newly-found contact info.
 
 State (parcels, leads, skip-trace cache, run history) lives in a SQLite database that is AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern used by LDR-Automation-Clean.
 
@@ -47,7 +51,7 @@ State (parcels, leads, skip-trace cache, run history) lives in a SQLite database
 | Owned 10+ years | +20 | ⚠️ Wired — auto-ingests from `data/inbox/` (see below) | Deed date from the free BCAD export (one open-records email), or 10 years of unchanged ownership in our own history |
 | Homestead exemption removed | +10 | ✅ Live (Bexar) | `HS` code present in the previous pull, missing in the current one |
 
-Leads scoring **40 or higher** are skip-traced and staged for approval. Weights and the threshold are tunable in `config/settings.yaml` — no code changes needed.
+Leads scoring **40 or higher** are skip-traced and auto-pushed (if contactable). Weights and the threshold are tunable in `config/settings.yaml` — no code changes needed.
 
 Score examples: absentee alone = 30 (not traced). Absentee + pre-foreclosure = 60 (traced). Absentee + divorce = 55 (traced). Absentee + homestead removed = 40 (traced).
 
@@ -121,8 +125,8 @@ Per project policy, we **stub rather than build a fragile scraper**. However, th
 
 ```
 LDR-Seller-Finder/
-├── run_weekly_pull.py            # Weekly cron entry point (data → score → trace → stage)
-├── run_push_approved.py          # Manual approval-gate entry point (push to FUB)
+├── run_weekly_pull.py            # Weekly cron entry point (data → score → trace → auto-push)
+├── run_push_approved.py          # Manual fallback entry point (retry pushes to FUB)
 ├── config/settings.yaml          # Scoring weights, county sources, budgets — edit freely
 ├── src/seller_finder/
 │   ├── config.py                 # Env secrets + settings loader
@@ -145,10 +149,10 @@ LDR-Seller-Finder/
 │   ├── import_deed_dates.py      # One-off deed-date import (or use data/inbox/)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 23 unit tests
+├── tests/test_pipeline.py        # 28 unit tests
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron
-    ├── workflows/push-approved.yml   # Manual trigger only
+    ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
     └── actions/state-sync/action.yml # Encrypted SQLite ⇄ `state` branch
 ```
 
@@ -158,17 +162,20 @@ LDR-Seller-Finder/
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| **Weekly Data Pull** | Cron `0 11 * * 1` (Mon 6:00 AM CDT) + manual | Full pipeline through staging. Uploads `pending-leads` artifact (review CSV + summary), writes the job summary, emails the digest, pings healthchecks.io |
-| **Push Approved Leads** | `workflow_dispatch` **only** | Pushes everything in `awaiting_approval` to FUB. Optional `exclude_ids` input skips specific leads. Supports `dry_run` |
+| **Weekly Data Pull** | Cron `0 11 * * 1` (Mon 6:00 AM CDT) + manual | Full pipeline **including auto-push to FUB**. Uploads `pending-leads` artifact (permanent push record: pushed / held / awaiting-retry), writes the job summary, emails the digest, pings healthchecks.io |
+| **Push Approved Leads** | `workflow_dispatch` (manual fallback) | Retries `awaiting_approval` (failed pushes / runs before FUB key existed) and `held_no_contact` leads. Optional `exclude_ids` input skips specific leads. Supports `dry_run` |
 
 > **DST note:** GitHub cron is UTC-only. `0 11` = 6:00 AM CDT (summer). When daylight saving ends in November, change to `0 12` to stay at 6:00 AM CST.
 
-### The approval gate, step by step
+### The auto-push flow, step by step
 
-1. Monday morning: weekly run finishes; you get the digest email (new leads found, score breakdown, count awaiting approval).
-2. Open the run in GitHub Actions → download the **pending-leads** artifact → review `pending_leads.csv` (owner, property, score, signals, traced phones/emails, DNC/litigator flags).
-3. Happy with the list? Actions → **Push Approved Leads** → Run workflow. To drop specific rows first, paste their `lead_id`s into the `exclude_ids` box (they're marked `skipped`).
-4. Leads land in FUB tagged `Seller Lead` + `County-Absentee` / `Divorce-Filing` / `Pre-Foreclosure`, with the property address, score, and signal breakdown in a note, plus a short Claude-written motivation summary.
+1. Monday morning: the weekly run pulls data, scores, and skip-traces qualified leads (≥ 40).
+2. **Auto-push runs at the end of the same run.** For every traced lead:
+   - **No email AND no phone from BatchData → HELD** (`held_no_contact`) — uncontactable records never enter FUB.
+   - **DNC or litigator flag → extra `DNC` tag** so the nurture system suppresses texting/calling.
+   - Otherwise the lead is pushed, tagged `Seller Lead` + `County-Absentee` / `Divorce-Filing` / `Pre-Foreclosure`, with property address, score, signal breakdown, and a short Claude-written motivation summary in a note.
+3. The **pending-leads artifact** on the run is the permanent record: every row shows `status` (`pushed` / `held_no_contact` / `awaiting_approval`) and the FUB person id for pushed leads. The digest email carries the same stats.
+4. Push failures stay `awaiting_approval` and retry automatically next Monday — or immediately via the **Push Approved Leads** fallback workflow. Held leads are re-traced (cache-safe, no double billing) if they still lack a skip trace, and re-checked for contact info on every fallback push.
 
 Duplicate protection: before creating anyone, the pusher searches FUB by email, then phone, then property address; existing contacts just get the new tags and note (never a duplicate record). Creation also uses FUB's `deduplicate=true` flag as a second net.
 
@@ -182,7 +189,7 @@ Skip tracing is the only per-unit cost in the system, so it is triple-guarded:
 2. **Owner-level cache** — results are stored by normalized owner name + mailing ZIP in `skip_traces`. The same owner is **never billed twice**, across runs, properties, or counties. Within a single run, multi-property owners are traced once and the result attached to all their leads.
 3. **Per-run budget** — `max_skip_traces_per_run: 200` in settings.yaml caps new traces per week (BatchData bills ~$0.07–0.12 per match, so worst case ≈ $14–24/week). Leads that miss the budget stay `qualified` and are picked up next run.
 
-BatchData filters TCPA-blacklisted numbers by default, and we store the `dnc` and `litigator` flags on every trace so they're visible in the review CSV before you approve.
+BatchData filters TCPA-blacklisted numbers by default, and we store the `dnc` and `litigator` flags on every trace — flagged leads are pushed with a `DNC` tag (so nurture suppresses calls/texts) and the flags remain visible in the push-record CSV.
 
 To swap providers later, implement `SkipTraceProvider.trace_batch()` in a new module and register it in `skiptrace/__init__.py`.
 
@@ -206,8 +213,8 @@ Everything else is **optional** and skipped gracefully when absent — no run wi
 
 | Secret(s) | What it unlocks | Without it |
 |---|---|---|
-| `BATCHDATA_API_KEY` | Skip tracing: owner phone numbers + emails on every qualified lead, with DNC/litigator flags, cached so no owner is billed twice. Sign up at [batchdata.io](https://batchdata.io) (pay-as-you-go, ~$0.07–0.12/match, budget-capped at 200/run) | Qualified leads still flow to the review CSV and FUB with full scores and signals — just no phone/email contact info |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM` | Monday digest email to peter@lifestyledesignrealty.com (new leads, score breakdown, awaiting-approval count). Reuse the exact same values from LDR-Automation-Clean's secrets (smtp.gmail.com / 587 / Gmail app password) | Same stats appear in the Actions run **job summary**; the lead list is in the `pending-leads` artifact |
+| `BATCHDATA_API_KEY` | Skip tracing: owner phone numbers + emails on every qualified lead, with DNC/litigator flags, cached so no owner is billed twice. Sign up at [batchdata.io](https://batchdata.io) (pay-as-you-go, ~$0.07–0.12/match, budget-capped at 200/run) | Qualified leads still appear in the review CSV with full scores and signals, but with no contact info they are **held, not pushed to FUB** (uncontactable records are never pushed). They are retraced and pushed automatically once the key is added |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM` | Monday digest email to peter@lifestyledesignrealty.com (new leads, pushed/held counts, score breakdown). Reuse the exact same values from LDR-Automation-Clean's secrets (smtp.gmail.com / 587 / Gmail app password) | Same stats appear in the Actions run **job summary**; the lead list is in the `pending-leads` artifact |
 | `HEALTHCHECK_URL` | Dead-man's switch: healthchecks.io emails you if a weekly run silently stops. You already have an account (LDR-Automation-Clean uses it) — add a check with period = 1 week, grace = 2 days, copy its `https://hc-ping.com/…` URL | GitHub still emails you on workflow *failures*; you just won't be alerted if the schedule itself silently stops firing |
 
 Adding any of these later requires **zero code changes** — add the secret and the next run picks it up.

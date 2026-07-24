@@ -1,9 +1,13 @@
-"""Follow Up Boss push — approval-gated, dedupe-safe, notes-rich.
+"""Follow Up Boss push — auto-push, dedupe-safe, notes-rich.
 
-Rules (per project spec):
-  * NOTHING is pushed automatically. The weekly run only stages leads as
-    status='awaiting_approval' and writes a review CSV. Pushing happens only
-    from the manually-triggered push-approved workflow (workflow_dispatch).
+Rules (per project spec, updated):
+  * The weekly Monday run AUTO-PUSHES qualified, skip-traced leads to FUB at
+    the end of the run — no manual approval step required. The push-approved
+    workflow remains available as a manual fallback.
+  * Leads with NO email AND NO phone from skip tracing are HELD
+    (status='held_no_contact') — uncontactable records are never pushed.
+  * Leads whose skip trace carries a DNC or litigator flag get an extra
+    "DNC" tag so the nurture system can suppress texting/calling.
   * Every lead gets tags: "Seller Lead" + source tag
     ("County-Absentee" | "Divorce-Filing" | "Pre-Foreclosure").
   * Property address, score, and signals go into the lead note.
@@ -32,18 +36,25 @@ def _auth():
 
 
 def _lead_contact(conn, lead: dict) -> dict:
-    """Pull best email/phone from the lead's skip trace."""
-    contact = {"emails": [], "phones": []}
+    """Pull best email/phone + DNC/litigator flags from the lead's skip trace."""
+    contact = {"emails": [], "phones": [], "dnc": False, "litigator": False}
     if lead.get("skip_trace_id"):
         row = conn.execute(
-            "SELECT emails, phones, matched FROM skip_traces WHERE id=?",
+            "SELECT emails, phones, matched, dnc, litigator FROM skip_traces WHERE id=?",
             (lead["skip_trace_id"],),
         ).fetchone()
         if row and row["matched"]:
             contact["emails"] = json.loads(row["emails"] or "[]")
             contact["phones"] = [p.get("number") for p in json.loads(row["phones"] or "[]")
                                  if p.get("number")]
+            contact["dnc"] = bool(row["dnc"])
+            contact["litigator"] = bool(row["litigator"])
     return contact
+
+
+def is_contactable(contact: dict) -> bool:
+    """A lead is pushable only if skip tracing produced an email OR a phone."""
+    return bool(contact["emails"] or contact["phones"])
 
 
 def find_existing_person(emails: list[str], phones: list[str], address: str) -> str | None:
@@ -134,6 +145,9 @@ def push_lead(conn, lead: dict) -> str | None:
     contact = _lead_contact(conn, lead)
     source_tag = config.TAG_BY_SOURCE.get(lead["primary_source"], "County-Absentee")
     tags = [config.TAG_SELLER, source_tag]
+    if contact["dnc"] or contact["litigator"]:
+        # Nurture system suppresses texting/calling anyone tagged DNC.
+        tags.append("DNC")
 
     existing_id = find_existing_person(contact["emails"], contact["phones"], lead["property_addr"])
 
@@ -189,15 +203,21 @@ def push_lead(conn, lead: dict) -> str | None:
         return None
 
 
-def push_approved_leads(conn) -> dict:
-    """Push all leads in 'awaiting_approval'. Called ONLY by push-approved workflow."""
-    stats = {"pushed": 0, "failed": 0, "total": 0}
-    leads = conn.execute(
-        "SELECT * FROM leads WHERE status='awaiting_approval' ORDER BY score DESC"
-    ).fetchall()
-    stats["total"] = len(leads)
+def _push_batch(conn, leads, stats: dict) -> dict:
+    """Shared push loop with contactability hold + status bookkeeping."""
     for row in leads:
         lead = dict(row)
+        contact = _lead_contact(conn, lead)
+        if not is_contactable(contact):
+            conn.execute(
+                "UPDATE leads SET status='held_no_contact', updated_at=? WHERE id=?",
+                (now_iso(), lead["id"]),
+            )
+            stats["held_no_contact"] += 1
+            conn.commit()
+            LOGGER.info("Lead %s (%s) HELD — skip trace returned no email and no phone",
+                        lead["id"], lead["owner_name"])
+            continue
         person_id = push_lead(conn, lead)
         if person_id:
             conn.execute(
@@ -205,12 +225,41 @@ def push_approved_leads(conn) -> dict:
                 (person_id, now_iso(), lead["id"]),
             )
             stats["pushed"] += 1
+        elif config.DRY_RUN:
+            stats["dry_run_would_push"] = stats.get("dry_run_would_push", 0) + 1
         else:
-            stats["failed"] += 1
+            stats["failed"] += 1  # stays awaiting_approval → retried next run
         conn.commit()
         time.sleep(0.5)  # stay well under FUB rate limits
     LOGGER.info("FUB push complete: %s", stats)
     return stats
+
+
+def auto_push_leads(conn) -> dict:
+    """Auto-push all awaiting leads at the end of the weekly run."""
+    stats = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0}
+    if not config.FUB_API_KEY:
+        LOGGER.warning("FUB_API_KEY not set — auto-push SKIPPED; leads stay in "
+                       "awaiting_approval for the push-approved fallback workflow.")
+        return stats
+    leads = conn.execute(
+        "SELECT * FROM leads WHERE status='awaiting_approval' ORDER BY score DESC"
+    ).fetchall()
+    stats["total"] = len(leads)
+    return _push_batch(conn, leads, stats)
+
+
+def push_approved_leads(conn) -> dict:
+    """Manual fallback: push 'awaiting_approval' leads (push-approved workflow).
+    Also retries 'held_no_contact' leads in case contact info has since been
+    cached by a re-trace."""
+    stats = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0}
+    leads = conn.execute(
+        "SELECT * FROM leads WHERE status IN ('awaiting_approval','held_no_contact') "
+        "ORDER BY score DESC"
+    ).fetchall()
+    stats["total"] = len(leads)
+    return _push_batch(conn, leads, stats)
 
 
 def _person_name(owner_name: str) -> tuple[str, str]:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Push approved leads to Follow Up Boss.
+"""Manual fallback: push leads to Follow Up Boss on demand.
 
-ONLY runs when the push-approved workflow is manually triggered
-(workflow_dispatch) — this is the approval gate. It pushes every lead in
-'awaiting_approval'. To exclude specific leads before pushing, run the
-exclude script first (scripts/exclude_leads.py) or pass lead IDs via the
-workflow's exclude_ids input.
+The weekly run auto-pushes qualified, contactable leads. This workflow
+(workflow_dispatch) is a manual fallback for retrying leads that were not
+auto-pushed: 'awaiting_approval' (push failures / runs without FUB key) and
+'held_no_contact' (retried in case contact info has since been found).
+To exclude specific leads, pass IDs via the workflow's exclude_ids input.
 """
 import argparse
 import logging

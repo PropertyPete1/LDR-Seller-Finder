@@ -1,10 +1,12 @@
-"""Approval gate artifacts: review CSV + run summary + weekly digest email.
+"""Run-record artifacts: review CSV + run summary + weekly digest email.
 
-The weekly run stages traced leads to 'awaiting_approval' and produces:
-  * review/pending_leads.csv        — uploaded as an Actions artifact
+The weekly run auto-pushes traced leads to FUB, then produces:
+  * review/pending_leads.csv        — record of every lead handled this run
+                                      (pushed / held_no_contact / awaiting retry),
+                                      uploaded as an Actions artifact
   * review/run_summary.md           — written to the Actions job summary
-Pushing to FUB only happens when the push-approved workflow is manually
-triggered (workflow_dispatch).
+The push-approved workflow remains as a manual fallback for leads that were
+not auto-pushed (e.g. FUB errors, or runs before FUB_API_KEY was configured).
 """
 import csv
 import datetime as dt
@@ -32,22 +34,29 @@ def stage_traced_leads(conn) -> int:
 
 
 def write_review_files(conn) -> dict:
-    """Write pending_leads.csv and run_summary.md. Returns stats."""
+    """Write pending_leads.csv (push record) and run_summary.md. Returns stats.
+
+    The CSV records every lead touched in the last 24h push cycle plus anything
+    still awaiting: status column shows pushed / held_no_contact /
+    awaiting_approval so there is a permanent artifact of what was sent to FUB."""
     config.REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = (dt.datetime.now(config.CT) - dt.timedelta(hours=24)).isoformat()
     rows = conn.execute(
         """SELECT l.id, l.county, l.prop_id, l.owner_name, l.property_addr, l.mail_addr,
-                  l.score, l.signals, l.primary_source, l.status,
+                  l.score, l.signals, l.primary_source, l.status, l.fub_person_id,
                   st.matched AS trace_matched, st.emails, st.phones, st.dnc, st.litigator
            FROM leads l LEFT JOIN skip_traces st ON st.id = l.skip_trace_id
-           WHERE l.status='awaiting_approval' ORDER BY l.score DESC"""
+           WHERE l.status='awaiting_approval'
+              OR (l.status IN ('pushed','held_no_contact') AND l.updated_at>=?)
+           ORDER BY l.status, l.score DESC""", (cutoff,)
     ).fetchall()
 
     csv_path = config.REVIEW_DIR / "pending_leads.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["lead_id", "county", "prop_id", "owner_name", "property_address",
-                    "mailing_address", "score", "primary_source", "signals",
-                    "trace_matched", "emails", "phones", "dnc", "litigator"])
+                    "mailing_address", "score", "primary_source", "signals", "status",
+                    "fub_person_id", "trace_matched", "emails", "phones", "dnc", "litigator"])
         for r in rows:
             signals = "; ".join(
                 f"{s['signal']}(+{s['points']})" for s in json.loads(r["signals"] or "[]")
@@ -58,8 +67,8 @@ def write_review_files(conn) -> dict:
             emails = "; ".join(json.loads(r["emails"] or "[]")) if r["emails"] else ""
             w.writerow([r["id"], r["county"], r["prop_id"], r["owner_name"],
                         r["property_addr"], r["mail_addr"], r["score"],
-                        r["primary_source"], signals, r["trace_matched"],
-                        emails, phones, r["dnc"], r["litigator"]])
+                        r["primary_source"], signals, r["status"], r["fub_person_id"],
+                        r["trace_matched"], emails, phones, r["dnc"], r["litigator"]])
 
     stats = _summary_stats(conn)
     md_path = config.REVIEW_DIR / "run_summary.md"
@@ -75,14 +84,19 @@ def _summary_stats(conn) -> dict:
         return row[0] if row and row[0] is not None else 0
 
     week_ago = (dt.datetime.now(config.CT) - dt.timedelta(days=7)).isoformat()
+    day_ago = (dt.datetime.now(config.CT) - dt.timedelta(hours=24)).isoformat()
     buckets = {}
     for lo, hi in ((40, 54), (55, 69), (70, 84), (85, 100)):
         buckets[f"{lo}-{hi}"] = one(
-            "SELECT COUNT(*) FROM leads WHERE score BETWEEN ? AND ? AND status='awaiting_approval'",
-            lo, hi,
+            "SELECT COUNT(*) FROM leads WHERE score BETWEEN ? AND ? "
+            "AND ((status='pushed' AND updated_at>=?) OR status='awaiting_approval')",
+            lo, hi, day_ago,
         )
     return {
         "new_leads_this_week": one("SELECT COUNT(*) FROM leads WHERE created_at>=?", week_ago),
+        "pushed_this_run": one(
+            "SELECT COUNT(*) FROM leads WHERE status='pushed' AND updated_at>=?", day_ago),
+        "held_no_contact": one("SELECT COUNT(*) FROM leads WHERE status='held_no_contact'"),
         "awaiting_approval": one("SELECT COUNT(*) FROM leads WHERE status='awaiting_approval'"),
         "pushed_total": one("SELECT COUNT(*) FROM leads WHERE status='pushed'"),
         "traced_total": one("SELECT COUNT(*) FROM skip_traces"),
@@ -90,7 +104,8 @@ def _summary_stats(conn) -> dict:
         "by_source": {
             r["primary_source"]: r["n"] for r in conn.execute(
                 "SELECT primary_source, COUNT(*) n FROM leads "
-                "WHERE status='awaiting_approval' GROUP BY primary_source"
+                "WHERE (status='pushed' AND updated_at>=?) OR status='awaiting_approval' "
+                "GROUP BY primary_source", (day_ago,)
             )
         },
     }
@@ -105,11 +120,13 @@ def render_summary_md(stats: dict, pending: int) -> str:
         f"| Metric | Value |",
         f"|---|---|",
         f"| New leads found this week | {stats['new_leads_this_week']} |",
-        f"| Leads awaiting approval | {stats['awaiting_approval']} |",
+        f"| Leads pushed to FUB this run | {stats['pushed_this_run']} |",
+        f"| Held — no email/phone from skip trace | {stats['held_no_contact']} |",
+        f"| Awaiting retry (push failed / no FUB key) | {stats['awaiting_approval']} |",
         f"| Leads pushed to FUB (all time) | {stats['pushed_total']} |",
         f"| Owners skip-traced (all time, cached) | {stats['traced_total']} |",
         "",
-        "## Score breakdown (awaiting approval)",
+        "## Score breakdown (this run)",
         "",
         "| Score band | Leads |",
         "|---|---|",
@@ -121,8 +138,11 @@ def render_summary_md(stats: dict, pending: int) -> str:
         lines.append(f"| {src} | {n} |")
     lines += [
         "",
-        "**Next step:** download the `pending-leads` artifact, review the CSV, then "
-        "manually run the **push-approved** workflow to send these leads to Follow Up Boss.",
+        "Qualified, contactable leads were **auto-pushed to Follow Up Boss** at the "
+        "end of this run. The `pending-leads` artifact is the permanent record of "
+        "what was pushed and held. If any leads show `awaiting_approval` (push "
+        "failures), they will retry next run — or trigger the **push-approved** "
+        "workflow to retry immediately.",
     ]
     return "\n".join(lines)
 
@@ -132,7 +152,7 @@ def send_digest_email(conn) -> bool:
     stats = _summary_stats(conn)
     subject = (
         f"LDR Seller Finder — {stats['new_leads_this_week']} new leads, "
-        f"{stats['awaiting_approval']} awaiting approval"
+        f"{stats['pushed_this_run']} pushed to FUB"
     )
     html_rows = "".join(
         f"<tr><td>{band}</td><td>{n}</td></tr>" for band, n in stats["score_buckets"].items()
@@ -143,14 +163,17 @@ def send_digest_email(conn) -> bool:
     html = f"""
     <h2>LDR Seller Finder — Weekly Digest</h2>
     <p><b>{stats['new_leads_this_week']}</b> new leads found this week.<br>
-    <b>{stats['awaiting_approval']}</b> qualified leads awaiting your approval.<br>
+    <b>{stats['pushed_this_run']}</b> leads auto-pushed to Follow Up Boss this run.<br>
+    <b>{stats['held_no_contact']}</b> held (skip trace found no email/phone).<br>
+    <b>{stats['awaiting_approval']}</b> awaiting retry (push failed / no FUB key).<br>
     <b>{stats['pushed_total']}</b> leads pushed to Follow Up Boss all-time.</p>
-    <h3>Score breakdown (awaiting approval)</h3>
+    <h3>Score breakdown (this run)</h3>
     <table border="1" cellpadding="4"><tr><th>Score band</th><th>Leads</th></tr>{html_rows}</table>
     <h3>By source</h3>
     <table border="1" cellpadding="4"><tr><th>Source</th><th>Leads</th></tr>{src_rows}</table>
-    <p>To push these to FUB: review the <b>pending-leads</b> artifact on the latest
-    weekly run, then trigger the <b>push-approved</b> workflow in GitHub Actions.</p>
+    <p>The <b>pending-leads</b> artifact on the weekly run is the permanent record of
+    what was pushed and held. Leads awaiting retry go out on the next run, or trigger
+    the <b>push-approved</b> workflow to retry immediately.</p>
     <p style="color:#888">Sent by LDR-Seller-Finder. This repo never contacts leads directly.</p>
     """
 

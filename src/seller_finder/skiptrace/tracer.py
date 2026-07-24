@@ -44,9 +44,14 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
     """
     stats = {"eligible": 0, "cached": 0, "traced": 0, "matched": 0,
              "budget_skipped": 0, "skipped_no_api_key": 0}
+    # 'qualified' = new this run; 'held_no_contact' without a real trace = leads
+    # that advanced before BATCHDATA_API_KEY existed — retrace them once the key
+    # is added so they can be pushed (the cache still prevents double billing).
     leads = conn.execute(
         "SELECT id, county, prop_id, owner_name, property_addr, mail_addr "
-        "FROM leads WHERE status='qualified' AND score>=? ORDER BY score DESC",
+        "FROM leads WHERE (status='qualified' OR "
+        "(status='held_no_contact' AND skip_trace_id IS NULL)) "
+        "AND score>=? ORDER BY score DESC",
         (config.SCORE_THRESHOLD,),
     ).fetchall()
     stats["eligible"] = len(leads)

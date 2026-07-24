@@ -1,6 +1,8 @@
-# Push Approved Leads to Follow Up Boss — MANUAL TRIGGER ONLY.
-# This is the approval gate: review the pending-leads artifact from the
-# latest Weekly Data Pull run first, then trigger this workflow.
+# Push Leads to Follow Up Boss — MANUAL FALLBACK.
+# The weekly run auto-pushes qualified, contactable leads at the end of every
+# Monday run. Use this workflow to retry failed pushes ('awaiting_approval')
+# or held no-contact leads on demand. The pending-leads artifact on the latest
+# Weekly Data Pull run shows what was pushed/held.
 name: Push Approved Leads
 on:
   workflow_dispatch:

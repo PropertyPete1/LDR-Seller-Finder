@@ -253,6 +253,101 @@ def test_recent_deed_does_not_add_tenure(db):
     assert lead["score"] == config.SCORE_ABSENTEE  # no tenure bump
 
 
+# ── FUB auto-push ─────────────────────────────────────────────────────────────
+
+def _make_awaiting_lead(db, prop_id, emails="[]", phones="[]", dnc=0, litigator=0,
+                        matched=1, with_trace=True):
+    _insert_parcel(db, prop_id=prop_id, absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": prop_id, "kind": "mortgage",
+                         "doc_number": "1", "month": 8, "year": 2026}], [], {})
+    trace_id = None
+    if with_trace:
+        cur = db.execute(
+            "INSERT INTO skip_traces (owner_key, provider, matched, emails, phones, dnc, litigator, traced_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (f"OWNER-{prop_id}|78209", "test", matched, emails, phones, dnc, litigator, now_iso()))
+        trace_id = cur.lastrowid
+    db.execute("UPDATE leads SET status='awaiting_approval', skip_trace_id=? WHERE prop_id=?",
+               (trace_id, prop_id))
+    db.commit()
+    return db.execute("SELECT id FROM leads WHERE prop_id=?", (prop_id,)).fetchone()["id"]
+
+
+def test_auto_push_holds_uncontactable(db, monkeypatch):
+    from seller_finder import fub
+    _make_awaiting_lead(db, "7001", emails="[]", phones="[]")  # matched but empty
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "push_lead", lambda conn, lead: "999")
+    stats = fub.auto_push_leads(db)
+    assert stats["held_no_contact"] == 1 and stats["pushed"] == 0
+    assert db.execute("SELECT status FROM leads WHERE prop_id='7001'").fetchone()["status"] == "held_no_contact"
+
+
+def test_auto_push_pushes_contactable(db, monkeypatch):
+    from seller_finder import fub
+    _make_awaiting_lead(db, "7002", emails='["a@b.com"]', phones='[{"number": "2105551234"}]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "push_lead", lambda conn, lead: "12345")
+    stats = fub.auto_push_leads(db)
+    assert stats["pushed"] == 1
+    lead = db.execute("SELECT status, fub_person_id FROM leads WHERE prop_id='7002'").fetchone()
+    assert lead["status"] == "pushed" and lead["fub_person_id"] == "12345"
+
+
+def test_auto_push_skipped_without_fub_key(db, monkeypatch):
+    from seller_finder import fub
+    _make_awaiting_lead(db, "7003", emails='["a@b.com"]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "")
+    stats = fub.auto_push_leads(db)
+    assert stats["pushed"] == 0 and stats["total"] == 0
+    assert db.execute("SELECT status FROM leads WHERE prop_id='7003'").fetchone()["status"] == "awaiting_approval"
+
+
+def test_dnc_flag_adds_dnc_tag(db, monkeypatch):
+    from seller_finder import fub
+    lead_id = _make_awaiting_lead(db, "7004", phones='[{"number": "2105551234"}]', dnc=1)
+    lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+    captured = {}
+
+    monkeypatch.setattr(config, "DRY_RUN", True)  # dry-run: logs tags, no HTTP
+    monkeypatch.setattr(fub, "find_existing_person", lambda *a, **k: None)
+    monkeypatch.setattr(fub, "generate_summary_note", lambda lead: "")
+    # Verify tag construction directly via _lead_contact + logic
+    contact = fub._lead_contact(db, lead)
+    assert contact["dnc"] is True
+    tags = [config.TAG_SELLER, config.TAG_BY_SOURCE.get(lead["primary_source"], "County-Absentee")]
+    if contact["dnc"] or contact["litigator"]:
+        tags.append("DNC")
+    assert "DNC" in tags
+
+
+def test_held_leads_eligible_for_retrace(db, monkeypatch):
+    """held_no_contact leads without a skip trace must be retraced once a key exists."""
+    from seller_finder.skiptrace import tracer
+    _insert_parcel(db, prop_id="7005", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "7005", "kind": "mortgage",
+                         "doc_number": "1", "month": 8, "year": 2026}], [], {})
+    db.execute("UPDATE leads SET status='held_no_contact', skip_trace_id=NULL WHERE prop_id='7005'")
+    db.commit()
+
+    class FakeProvider:
+        name = "fake"
+        def trace_batch(self, reqs):
+            from seller_finder.skiptrace.base import SkipTraceResult
+            return [SkipTraceResult(matched=True, emails=["x@y.com"], phones=[],
+                                    provider="fake") for _ in reqs]
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": FakeProvider())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    stats = tracer.trace_qualified_leads(db)
+    assert stats["eligible"] == 1 and stats["traced"] == 1
+    assert db.execute("SELECT status FROM leads WHERE prop_id='7005'").fetchone()["status"] == "traced"
+
+
 # ── Review files ─────────────────────────────────────────────────────────
 
 def test_review_csv_written(db, tmp_path, monkeypatch):

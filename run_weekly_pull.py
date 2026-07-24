@@ -9,10 +9,14 @@ Steps:
   5. Ingest deed-date CSVs from data/inbox/ (BCAD export → tenure signal), then
      score all leads; qualify at threshold.
   6. Skip-trace qualified leads (cached, budgeted).
-  7. Stage traced leads for approval + write review CSV / run summary.
-  8. Send weekly digest email; ping healthchecks.io.
+  7. AUTO-PUSH qualified, skip-traced, contactable leads to Follow Up Boss
+     (dedupe by email/phone/address; "Seller Lead" + source tags; DNC tag for
+     flagged owners; leads with no email AND no phone are held, not pushed).
+  8. Write review CSV (permanent push record) + run summary.
+  9. Send weekly digest email; ping healthchecks.io.
 
-NO leads are pushed to Follow Up Boss here — see run_push_approved.py.
+The push-approved workflow (run_push_approved.py) remains a manual fallback
+for retrying failed/held pushes.
 """
 import logging
 import sys
@@ -25,6 +29,7 @@ from seller_finder.sources import parcels, exemptions, preforeclosure, divorce, 
 from seller_finder.scoring import compute_scores  # noqa: E402
 from seller_finder.skiptrace.tracer import trace_qualified_leads  # noqa: E402
 from seller_finder.review import stage_traced_leads, write_review_files, send_digest_email  # noqa: E402
+from seller_finder.fub import auto_push_leads  # noqa: E402
 from seller_finder.health import ping_healthcheck  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -90,11 +95,18 @@ def main() -> int:
     # 6. Skip trace (cost-guarded)
     stats["skiptrace"] = trace_qualified_leads(conn)
 
-    # 7. Approval gate artifacts
+    # 7. Auto-push to Follow Up Boss (contactable leads only; DNC tagged)
     stats["staged"] = stage_traced_leads(conn)
+    try:
+        stats["fub_push"] = auto_push_leads(conn)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("FUB auto-push failed: %s", exc, exc_info=True)
+        stats["fub_push"] = {"error": str(exc)}
+
+    # 8. Run-record artifacts (CSV documents what was pushed/held)
     stats["review"] = write_review_files(conn)
 
-    # 8. Digest + heartbeat
+    # 9. Digest + heartbeat
     stats["digest_sent"] = send_digest_email(conn)
     record_run(conn, "weekly_pull", started, stats)
     ping_healthcheck()
