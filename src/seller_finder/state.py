@@ -169,6 +169,7 @@ def get_db(path: Path | None = None, parcels_cache: Path | None = None,
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _migrate_legacy(conn)
+    _migrate_versioned(conn)
 
     cache = str(parcels_cache) if parcels_cache is not None \
         else str(db_path.parent / "parcels_cache.sqlite3")
@@ -216,6 +217,34 @@ def _migrate_legacy(conn: sqlite3.Connection) -> None:
     conn.commit()
     conn.execute("VACUUM")
     LOGGER.info("Legacy migration complete")
+
+
+def _migrate_versioned(conn: sqlite3.Connection) -> None:
+    """Versioned one-time migrations tracked via PRAGMA user_version."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    if version < 2:
+        # v2 (2026-07): a BatchData 403 (token missing the skip-trace endpoint
+        # permission) was recorded as 64 "completed" no-match traces, which
+        # permanently blocked re-tracing those owners. Purge ALL cached
+        # no-match entries (matched results are untouched — already paid for)
+        # and requeue the affected leads so the next run re-traces them.
+        stale = [r["id"] for r in conn.execute(
+            "SELECT id FROM skip_traces WHERE matched=0")]
+        if stale:
+            ph = ",".join("?" * len(stale))
+            requeued = conn.execute(
+                f"UPDATE leads SET status='qualified', skip_trace_id=NULL, "
+                f"updated_at=? WHERE skip_trace_id IN ({ph}) "
+                f"AND status IN ('traced','held_no_contact')",
+                (now_iso(), *stale)).rowcount
+            conn.execute(f"DELETE FROM skip_traces WHERE id IN ({ph})", stale)
+            LOGGER.info(
+                "Migration v2: purged %d cached no-match skip-trace entries "
+                "(poisoned by the 403 error bug) and requeued %d leads for "
+                "re-tracing", len(stale), requeued)
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
 
 
 def owner_hash(owner_name: str) -> int:

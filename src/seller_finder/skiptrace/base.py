@@ -15,6 +15,10 @@ class SkipTraceResult:
     litigator: bool = False
     raw: dict = field(default_factory=dict)
     provider: str = ""
+    # Set when the API call itself failed (HTTP error, network, bad payload).
+    # Errors are NOT the same as no-match: they must never be cached, and the
+    # lead stays eligible for retry on the next run.
+    error: str | None = None
 
 
 @dataclass

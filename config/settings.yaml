@@ -23,6 +23,11 @@ scoring:
 # Cost guard: max NEW owners skip-traced per weekly run.
 max_skip_traces_per_run: 200
 
+# Skip-trace cache policy: MATCHED results are cached forever (already paid
+# for). NO-MATCH results expire after this many days so the owner can be
+# re-traced later as provider data improves. API errors are never cached.
+no_match_retrace_days: 90
+
 # TxGIO StratMap land-parcel bulk downloads (CC0, statewide program).
 # collection_id is the "Land Parcels 2025" collection; the loader queries the
 # TxGIO API for the newest collection automatically and falls back to this.

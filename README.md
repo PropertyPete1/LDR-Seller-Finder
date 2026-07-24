@@ -179,7 +179,7 @@ LDR-Seller-Finder/
 │   ├── refresh_parcel_mirror.sh  # Quarterly parcel-mirror refresh (run from home network)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 35 unit tests
+├── tests/test_pipeline.py        # 41 unit tests
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
@@ -220,6 +220,20 @@ Skip tracing is the only per-unit cost in the system, so it is triple-guarded:
 3. **Per-run budget** — `max_skip_traces_per_run: 200` in settings.yaml caps new traces per week (BatchData bills ~$0.07–0.12 per match, so worst case ≈ $14–24/week). Leads that miss the budget stay `qualified` and are picked up next run.
 
 BatchData filters TCPA-blacklisted numbers by default, and we store the `dnc` and `litigator` flags on every trace — flagged leads are pushed with a `DNC` tag (so nurture suppresses calls/texts) and the flags remain visible in the push-record CSV.
+
+### Error vs no-match discipline
+
+The provider distinguishes **API errors** from **genuine no-matches** — they are handled completely differently:
+
+| Outcome | Cached? | Lead status | Next run |
+|---|---|---|---|
+| **Matched** (contact info returned) | Forever — already paid for | `traced` → pushed/held | Uses cache |
+| **No-match** (API succeeded, no data found) | Yes, but expires after `no_match_retrace_days` (90) | `held_no_contact` | Re-traced after expiry as provider data improves |
+| **API error** (401/402/403/422/429/5xx, network) | **Never** | stays `qualified` | Retried automatically |
+
+Every request logs the raw HTTP status and response body to the Actions log (the API key is never logged), and 429/5xx responses are retried with exponential backoff. The run-summary diagnostics table shows the matched / no-match / error breakdown with the top error message, so a failing token is visible at a glance instead of masquerading as "0% match rate."
+
+> **BatchData 403 Forbidden?** Per BatchData's own troubleshooting guide, this means the API token lacks the **Property Skip Trace** endpoint permission or the PayGo wallet is empty. Fix: BatchData dashboard → **API Tokens** (key icon) → your token → **View/Update** → check the *Property Skip Trace* permission, and confirm your wallet has balance. Erred leads re-trace automatically on the next run — no manual cleanup needed.
 
 To swap providers later, implement `SkipTraceProvider.trace_batch()` in a new module and register it in `skiptrace/__init__.py`.
 
@@ -278,7 +292,7 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ```bash
 pip install -r requirements.txt pytest
-python3 -m pytest tests/ -v          # 35 unit tests (scoring, dedupe, matching, migration, size guard)
+python3 -m pytest tests/ -v          # 41 unit tests (scoring, dedupe, matching, migration, error handling)
 DRY_RUN=true python3 scripts/e2e_live_test.py   # live smoke test, zero spend
 ```
 

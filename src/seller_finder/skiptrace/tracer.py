@@ -5,7 +5,15 @@ Cost controls:
   * skip_traces table caches results by owner_key (name + mail zip) — an
     owner is NEVER paid for twice, even across counties/properties.
   * MAX_SKIP_TRACES_PER_RUN caps spend per weekly run.
+
+Error vs no-match discipline:
+  * API ERRORS (provider returns result.error) are never cached and never
+    marked traced — the lead stays 'qualified' and is retried next run.
+  * Genuine NO-MATCH results are cached, but expire after
+    no_match_retrace_days (settings.yaml, default 90) so owners can be
+    re-traced later; MATCHED results are cached forever (already paid for).
 """
+import datetime as _dt
 import json
 import logging
 import re
@@ -43,7 +51,12 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
     contact info (stats["skipped_no_api_key"] reports how many).
     """
     stats = {"eligible": 0, "cached": 0, "traced": 0, "matched": 0,
+             "no_match": 0, "errors": 0, "top_error": "",
              "budget_skipped": 0, "skipped_no_api_key": 0}
+    # Expire stale no-match cache entries FIRST so their leads re-enter the
+    # eligibility query below in this same run.
+    if config.BATCHDATA_API_KEY:
+        _expire_stale_no_matches(conn)
     # 'qualified' = new this run; 'held_no_contact' without a real trace = leads
     # that advanced before BATCHDATA_API_KEY existed — retrace them once the key
     # is added so they can be pushed (the cache still prevents double billing).
@@ -114,8 +127,16 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
         return stats
 
     if to_trace:
+        error_counts: dict[str, int] = {}
         results = provider.trace_batch([req for _, req, _ in to_trace])
         for (lead, _req, okey), result in zip(to_trace, results):
+            if result.error:
+                # API failure — do NOT cache, do NOT mark traced. The lead
+                # keeps its current status ('qualified'/'held_no_contact')
+                # and is retried automatically on the next run.
+                stats["errors"] += 1
+                error_counts[result.error] = error_counts.get(result.error, 0) + 1
+                continue
             cur = conn.execute(
                 """INSERT OR IGNORE INTO skip_traces
                    (owner_key, provider, matched, emails, phones, dnc, litigator, raw, traced_at)
@@ -139,10 +160,43 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
                 )
             stats["traced"] += 1
             stats["matched"] += int(result.matched)
+            stats["no_match"] += int(not result.matched)
+        if error_counts:
+            stats["top_error"] = max(error_counts, key=error_counts.get)[:300]
+            LOGGER.error(
+                "Skip trace: %d API errors this run (NOT cached, will retry next "
+                "run). Top error: %s", stats["errors"], stats["top_error"])
 
     conn.commit()
     LOGGER.info("Skip tracing: %s", stats)
     return stats
+
+
+def _expire_stale_no_matches(conn) -> int:
+    """Delete cached NO-MATCH entries older than no_match_retrace_days.
+
+    Matched results are kept forever (already paid for, data rarely improves
+    week-to-week); no-matches expire so owners get re-traced periodically as
+    providers refresh their data. Leads pointing at an expired trace are
+    reset to 'qualified' so they re-enter the tracing queue.
+    """
+    days = int(config.SETTINGS.get("no_match_retrace_days", 90))
+    cutoff = _dt.datetime.now(config.CT) - _dt.timedelta(days=days)
+    stale = [r["id"] for r in conn.execute(
+        "SELECT id FROM skip_traces WHERE matched=0 AND traced_at < ?",
+        (cutoff.isoformat(timespec="seconds"),))]
+    if not stale:
+        return 0
+    ph = ",".join("?" * len(stale))
+    conn.execute(
+        f"UPDATE leads SET status='qualified', skip_trace_id=NULL, updated_at=? "
+        f"WHERE skip_trace_id IN ({ph}) AND status IN ('traced','held_no_contact')",
+        (now_iso(), *stale))
+    conn.execute(f"DELETE FROM skip_traces WHERE id IN ({ph})", stale)
+    conn.commit()
+    LOGGER.info("Expired %d stale no-match skip-trace cache entries (>%d days) — "
+                "affected leads re-queued for tracing", len(stale), days)
+    return len(stale)
 
 
 def _mail_zip(mail_addr: str) -> str:

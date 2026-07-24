@@ -164,8 +164,19 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
     st = run_stats.get("skiptrace") or {}
     lines.append(
         f"| Skip trace | all | eligible {st.get('eligible', 0)}, cached "
-        f"{st.get('cached', 0)}, traced {st.get('traced', 0)}, matched "
-        f"{st.get('matched', 0)}, no-key-skipped {st.get('skipped_no_api_key', 0)} |")
+        f"{st.get('cached', 0)}, traced {st.get('traced', 0)}, no-key-skipped "
+        f"{st.get('skipped_no_api_key', 0)} |")
+    if st.get("errors"):
+        lines.append(
+            f"| Skip trace outcomes | all | ✅ matched {st.get('matched', 0)}, "
+            f"no-match {st.get('no_match', 0)}, ❌ **API errors "
+            f"{st.get('errors', 0)}** (not cached — will retry next run) |")
+        lines.append(
+            f"| Skip trace top error | all | `{str(st.get('top_error', ''))[:200]}` |")
+    elif st.get("traced") or st.get("matched"):
+        lines.append(
+            f"| Skip trace outcomes | all | matched {st.get('matched', 0)}, "
+            f"no-match {st.get('no_match', 0)}, errors 0 |")
     fp = run_stats.get("fub_push") or {}
     if "error" in fp:
         lines.append(f"| FUB push | all | ❌ ERROR: {str(fp['error'])[:120]} |")

@@ -183,6 +183,161 @@ def test_skip_trace_cache_prevents_double_billing(db, monkeypatch):
     assert stats1["cached"] == 1 or calls["n"] == 1
 
 
+# ── Skip-trace error handling (errors are NOT no-matches) ────────────
+
+def test_api_error_not_cached_lead_stays_qualified(db, monkeypatch):
+    """An API error (e.g. 403) must NOT create a cache entry or mark the lead
+    traced — the lead stays 'qualified' and is retried next run."""
+    from seller_finder.skiptrace import tracer
+    from seller_finder.skiptrace.base import SkipTraceResult
+
+    _insert_parcel(db, prop_id="6001", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "6001", "kind": "mortgage",
+                         "doc_number": "1", "month": 8, "year": 2026}], [], {})
+
+    class ErrorProvider:
+        name = "err"
+        def trace_batch(self, reqs):
+            return [SkipTraceResult(provider="err",
+                                    error="HTTP 403: Forbidden") for _ in reqs]
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": ErrorProvider())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+
+    stats = tracer.trace_qualified_leads(db)
+    assert stats["errors"] == 1
+    assert stats["traced"] == 0
+    assert "403" in stats["top_error"]
+    # No poisoned cache entry:
+    assert db.execute("SELECT COUNT(*) c FROM skip_traces").fetchone()["c"] == 0
+    # Lead is still qualified → retried automatically next run:
+    lead = db.execute("SELECT status, skip_trace_id FROM leads WHERE prop_id='6001'").fetchone()
+    assert lead["status"] == "qualified" and lead["skip_trace_id"] is None
+
+
+def test_batchdata_403_returns_error_results(monkeypatch):
+    """Provider surfaces raw status+body as error on 403 (no retry for 4xx)."""
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class FakeResp:
+        status_code = 403
+        text = '{"status":{"code":403,"text":"Forbidden"}}'
+
+    posts = {"n": 0}
+    def fake_post(*a, **k):
+        posts["n"] += 1
+        return FakeResp()
+    monkeypatch.setattr(batchdata.requests, "post", fake_post)
+
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([SkipTraceRequest(street="1 A ST", city="SA", state="TX", zip="78201")])
+    assert posts["n"] == 1  # 403 is permanent — no pointless retries
+    assert out[0].error and "403" in out[0].error and "Forbidden" in out[0].error
+    assert out[0].matched is False
+
+
+def test_batchdata_429_retries_then_succeeds(monkeypatch):
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R429:
+        status_code = 429
+        text = "rate limited"
+    class R200:
+        status_code = 200
+        text = "{}"
+        @staticmethod
+        def json():
+            return {"results": {"persons": [], "meta": {"results": {
+                "matchCount": 0, "noMatchCount": 1, "errorCount": 0}}}}
+
+    seq = [R429(), R200()]
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr(batchdata.time, "sleep", lambda s: None)
+
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([SkipTraceRequest(street="1 A ST", city="SA", state="TX", zip="78201")])
+    assert out[0].error is None  # succeeded after retry
+    assert out[0].matched is False  # genuine no-match
+
+
+def test_no_match_cache_expires_and_requeues(db, monkeypatch):
+    """Cached no-match entries older than no_match_retrace_days expire and the
+    lead re-enters the tracing queue."""
+    from seller_finder.skiptrace import tracer
+    from seller_finder.skiptrace.base import SkipTraceResult
+
+    _insert_parcel(db, prop_id="6101", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "6101", "kind": "mortgage",
+                         "doc_number": "1", "month": 8, "year": 2026}], [], {})
+    # Seed an OLD no-match cache entry attached to the lead.
+    db.execute(
+        "INSERT INTO skip_traces (owner_key, provider, matched, emails, phones, "
+        "dnc, litigator, raw, traced_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (owner_key("SMITH JOHN", "78209"), "batchdata", 0, "[]", "[]", 0, 0,
+         "null", "2026-01-01T00:00:00"))
+    tid = db.execute("SELECT id FROM skip_traces").fetchone()["id"]
+    db.execute("UPDATE leads SET status='held_no_contact', skip_trace_id=? "
+               "WHERE prop_id='6101'", (tid,))
+    db.commit()
+
+    class MatchProvider:
+        name = "m"
+        def trace_batch(self, reqs):
+            return [SkipTraceResult(matched=True, emails=["a@b.com"],
+                                    provider="m") for _ in reqs]
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": MatchProvider())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+
+    stats = tracer.trace_qualified_leads(db)
+    # Old no-match expired → lead requeued → re-traced → matched this time.
+    assert stats["matched"] == 1
+    lead = db.execute("SELECT status FROM leads WHERE prop_id='6101'").fetchone()
+    assert lead["status"] == "traced"
+    assert db.execute("SELECT COUNT(*) c FROM skip_traces WHERE matched=0").fetchone()["c"] == 0
+
+
+def test_migration_v2_purges_poisoned_no_matches(tmp_path):
+    """Opening a pre-v2 DB deletes matched=0 cache rows and requeues leads."""
+    import sqlite3
+    db_file = tmp_path / "old.sqlite3"
+    conn = get_db(db_file, parcels_cache=tmp_path / "c1.sqlite3")
+    # Simulate the poisoned state from the 403 run: no-match cache + traced lead.
+    conn.execute(
+        "INSERT INTO skip_traces (owner_key, provider, matched, emails, phones, "
+        "dnc, litigator, raw, traced_at) VALUES ('K|1','batchdata',0,'[]','[]',0,0,'null',?)",
+        (now_iso(),))
+    tid = conn.execute("SELECT id FROM skip_traces").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO leads (county, prop_id, owner_name, property_addr, mail_addr, "
+        "score, signals, status, skip_trace_id, created_at, updated_at) "
+        "VALUES ('bexar','9001','X','1 A ST','2 B ST',60,'{}','held_no_contact',?,?,?)",
+        (tid, now_iso(), now_iso()))
+    conn.execute("PRAGMA user_version = 0")  # pretend pre-v2
+    conn.commit()
+    conn.close()
+
+    conn2 = get_db(db_file, parcels_cache=tmp_path / "c2.sqlite3")
+    assert conn2.execute("SELECT COUNT(*) c FROM skip_traces WHERE matched=0").fetchone()["c"] == 0
+    lead = conn2.execute("SELECT status, skip_trace_id FROM leads WHERE prop_id='9001'").fetchone()
+    assert lead["status"] == "qualified" and lead["skip_trace_id"] is None
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == 2
+    conn2.close()
+
+
+def test_diagnostics_show_trace_outcomes():
+    from seller_finder.review import _diagnostics_md
+    md = "\n".join(_diagnostics_md({"skiptrace": {
+        "eligible": 65, "cached": 1, "traced": 0, "matched": 0, "no_match": 0,
+        "errors": 64, "top_error": "HTTP 403: Forbidden", "skipped_no_api_key": 0}}))
+    assert "API errors" in md and "64" in md
+    assert "HTTP 403: Forbidden" in md
+
+
 # ── Optional secrets (graceful degradation) ────────────────────────────
 
 def test_no_batchdata_key_still_advances_leads(db, monkeypatch):

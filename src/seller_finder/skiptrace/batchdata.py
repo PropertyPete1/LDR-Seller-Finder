@@ -1,13 +1,25 @@
 """BatchData / BatchSkipTracing provider.
 
 API: POST https://api.batchdata.com/api/v1/property/skip-trace
+     (verified against developer.batchdata.com, July 2026)
 Auth: Authorization: Bearer <BATCHDATA_API_KEY>
 Up to 100 properties per request; billed per MATCHED result, so caching in
 the state DB (never trace the same owner twice) directly controls cost.
 TCPA-blacklisted phones are filtered out by BatchData by default — we keep
 that default and also store dnc/litigator flags.
+
+Error handling contract:
+  * The raw HTTP status and response body are logged for every request so
+    failures are visible in the Actions log (the API key is never logged).
+  * API errors (401/402/403/422/429/5xx, network failures) are returned as
+    results with `error` set — the tracer must NOT cache these or mark the
+    lead traced. 403 usually means the API token lacks the "Property Skip
+    Trace" endpoint permission or the PayGo wallet is empty (per BatchData's
+    own troubleshooting guide).
+  * 429 (rate limit) is retried with exponential backoff before giving up.
 """
 import logging
+import time
 
 import requests
 
@@ -47,24 +59,20 @@ class BatchDataProvider(SkipTraceProvider):
                 item["name"] = {"first": r.owner_first, "last": r.owner_last}
             body["requests"].append(item)
 
-        try:
-            resp = requests.post(
-                API_URL,
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-                timeout=300,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("BatchData request failed: %s", exc)
-            return [SkipTraceResult(provider=self.name) for _ in chunk]
+        data, err = self._post_with_retry(body, len(chunk))
+        if err is not None:
+            # API-level failure: every request in this chunk is an ERROR, not a
+            # no-match. The tracer must not cache these results.
+            return [SkipTraceResult(provider=self.name, error=err) for _ in chunk]
 
         persons = data.get("results", {}).get("persons", [])
+        # meta.results = {requestCount, matchCount, noMatchCount, errorCount}
+        meta = (data.get("results", {}) or {}).get("meta", {}) or {}
+        counts = meta.get("results") if isinstance(meta.get("results"), dict) else meta
+        LOGGER.info(
+            "BatchData OK: sent=%d matchCount=%s noMatchCount=%s errorCount=%s",
+            len(chunk), counts.get("matchCount", "?"),
+            counts.get("noMatchCount", "?"), counts.get("errorCount", "?"))
         # Index persons by property-address hash-ish key so results align.
         by_addr: dict[str, dict] = {}
         for p in persons:
@@ -93,6 +101,58 @@ class BatchDataProvider(SkipTraceProvider):
                 provider=self.name,
             ))
         return out
+
+    def _post_with_retry(self, body: dict, n_items: int,
+                         max_attempts: int = 3) -> tuple[dict | None, str | None]:
+        """POST to the API; retry 429/5xx with backoff. Returns (data, error).
+
+        Logs the raw HTTP status + response body on every failure so the
+        Actions log shows exactly what BatchData said (key never logged).
+        """
+        last_err = "unknown error"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.post(
+                    API_URL,
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    timeout=300,
+                )
+            except Exception as exc:  # noqa: BLE001 — network-level failure
+                last_err = f"network error: {exc}"
+                LOGGER.error("BatchData request failed (attempt %d/%d, %d items): %s",
+                             attempt, max_attempts, n_items, last_err)
+                time.sleep(2 ** attempt)
+                continue
+
+            body_text = (resp.text or "")[:2000]
+            if resp.status_code == 200:
+                try:
+                    return resp.json(), None
+                except ValueError:
+                    last_err = f"HTTP 200 but non-JSON body: {body_text}"
+                    LOGGER.error("BatchData response parse failed: %s", last_err)
+                    return None, last_err
+
+            last_err = f"HTTP {resp.status_code}: {body_text}"
+            LOGGER.error(
+                "BatchData API error (attempt %d/%d, %d items) — status=%d body=%s",
+                attempt, max_attempts, n_items, resp.status_code, body_text,
+            )
+            if resp.status_code == 403:
+                LOGGER.error(
+                    "HINT: BatchData 403 usually means the API token is missing the "
+                    "'Property Skip Trace' endpoint permission (dashboard → API Tokens "
+                    "→ View/Update) or the PayGo wallet has no balance.")
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                time.sleep(5 * 2 ** (attempt - 1))
+                continue
+            break  # 4xx (non-429) won't succeed on retry
+        return None, last_err
 
     @staticmethod
     def _addr_key(street: str, zip_code: str) -> str:
