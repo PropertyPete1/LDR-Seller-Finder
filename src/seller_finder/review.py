@@ -158,7 +158,11 @@ def send_digest_email(conn) -> bool:
         LOGGER.info("[DRY-RUN] Would send digest: %s", subject)
         return True
     if not (config.SMTP_USER and config.SMTP_PASSWORD):
-        LOGGER.warning("SMTP creds missing — digest not sent")
+        LOGGER.warning(
+            "SMTP secrets not configured — digest email SKIPPED (optional). "
+            "Review stats are in the Actions job summary and the "
+            "'pending-leads' artifact. Add SMTP_USER/SMTP_PASSWORD to enable."
+        )
         return False
 
     msg = MIMEMultipart("alternative")

@@ -182,20 +182,29 @@ To swap providers later, implement `SkipTraceProvider.trace_batch()` in a new mo
 
 ## Setup
 
-### 1. Repository secrets (Settings → Secrets and variables → Actions)
+### Required secrets (the system runs fully with just these three)
+
+Add at **Settings → Secrets and variables → Actions**:
 
 | Secret | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Claude for divorce name-matching and FUB note summaries |
 | `FUB_API_KEY` | Follow Up Boss API (same account as LDR-Automation-Clean) |
-| `BATCHDATA_API_KEY` | BatchData skip tracing (sign up at batchdata.io, pay-as-you-go) |
-| `SQLITE_ENCRYPTION_KEY` | Long random passphrase for state DB encryption (e.g. `openssl rand -hex 32`) |
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `EMAIL_FROM` | Digest email (same Gmail app-password setup as LDR-Automation-Clean) |
-| `HEALTHCHECK_URL` | healthchecks.io ping URL (create a check with a 8-day grace period) |
+| `SQLITE_ENCRYPTION_KEY` | Passphrase encrypting the state DB on the `state` branch (e.g. `openssl rand -hex 32`). **Never lose it** — the state DB is unrecoverable without it |
 
-The system degrades gracefully: a missing `BATCHDATA_API_KEY` just means leads stay at `qualified`; missing SMTP means no digest but the run summary still appears in Actions.
+Everything else is **optional** and skipped gracefully when absent — no run will ever fail because an optional secret is missing (verified by `scripts/minimal_secrets_test.py`).
 
-### 2. First run
+### Upgrade path — what each optional secret unlocks
+
+| Secret(s) | What it unlocks | Without it |
+|---|---|---|
+| `BATCHDATA_API_KEY` | Skip tracing: owner phone numbers + emails on every qualified lead, with DNC/litigator flags, cached so no owner is billed twice. Sign up at [batchdata.io](https://batchdata.io) (pay-as-you-go, ~$0.07–0.12/match, budget-capped at 200/run) | Qualified leads still flow to the review CSV and FUB with full scores and signals — just no phone/email contact info |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM` | Monday digest email to peter@lifestyledesignrealty.com (new leads, score breakdown, awaiting-approval count). Reuse the exact same values from LDR-Automation-Clean's secrets (smtp.gmail.com / 587 / Gmail app password) | Same stats appear in the Actions run **job summary**; the lead list is in the `pending-leads` artifact |
+| `HEALTHCHECK_URL` | Dead-man's switch: healthchecks.io emails you if a weekly run silently stops. You already have an account (LDR-Automation-Clean uses it) — add a check with period = 1 week, grace = 2 days, copy its `https://hc-ping.com/…` URL | GitHub still emails you on workflow *failures*; you just won't be alerted if the schedule itself silently stops firing |
+
+Adding any of these later requires **zero code changes** — add the secret and the next run picks it up.
+
+### First run
 
 Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data sources, then run it for real. The first run downloads both county parcel files (~10 min) and establishes the ownership/exemption baseline — homestead-removed and owner-change signals begin firing from the *second* run onward.
 

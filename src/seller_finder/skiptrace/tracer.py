@@ -36,8 +36,14 @@ def _split_situs(property_addr: str) -> tuple[str, str, str, str]:
 
 
 def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
-    """Trace all qualified, untraced leads (budget/cached). Returns stats."""
-    stats = {"eligible": 0, "cached": 0, "traced": 0, "matched": 0, "budget_skipped": 0}
+    """Trace all qualified, untraced leads (budget/cached). Returns stats.
+
+    OPTIONAL SECRET: if BATCHDATA_API_KEY is not configured, skip tracing is
+    skipped entirely and qualified leads advance to the review stage without
+    contact info (stats["skipped_no_api_key"] reports how many).
+    """
+    stats = {"eligible": 0, "cached": 0, "traced": 0, "matched": 0,
+             "budget_skipped": 0, "skipped_no_api_key": 0}
     leads = conn.execute(
         "SELECT id, county, prop_id, owner_name, property_addr, mail_addr "
         "FROM leads WHERE status='qualified' AND score>=? ORDER BY score DESC",
@@ -45,6 +51,22 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
     ).fetchall()
     stats["eligible"] = len(leads)
     if not leads:
+        return stats
+
+    if not config.BATCHDATA_API_KEY:
+        # No skip-trace provider configured — advance leads without contact info.
+        for lead in leads:
+            conn.execute(
+                "UPDATE leads SET status='traced', updated_at=? WHERE id=?",
+                (now_iso(), lead["id"]),
+            )
+        conn.commit()
+        stats["skipped_no_api_key"] = len(leads)
+        LOGGER.warning(
+            "BATCHDATA_API_KEY not set — skip tracing SKIPPED for %d qualified "
+            "leads; they will appear in the review CSV without contact info. "
+            "Add the secret to unlock phones/emails.", len(leads),
+        )
         return stats
 
     provider = get_provider(provider_name)

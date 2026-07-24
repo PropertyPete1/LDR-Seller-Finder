@@ -12,7 +12,7 @@ def ping_healthcheck() -> None:
     """GET the HEALTHCHECK_URL. Failures are logged, never crash the run."""
     url = config.HEALTHCHECK_URL
     if not url:
-        LOGGER.warning("HEALTHCHECK_URL not set — dead-man's switch not configured")
+        LOGGER.info("HEALTHCHECK_URL not set — heartbeat ping SKIPPED (optional)")
         return
     if config.DRY_RUN:
         LOGGER.info("[DRY-RUN] Skipping healthchecks.io ping")

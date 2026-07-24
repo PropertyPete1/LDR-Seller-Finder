@@ -150,10 +150,44 @@ def test_skip_trace_cache_prevents_double_billing(db, monkeypatch):
 
     monkeypatch.setattr(tracer, "get_provider", lambda name="x": FakeProvider())
     monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key-for-test")
 
     stats1 = tracer.trace_qualified_leads(db)
     assert stats1["traced"] == 1  # same owner both parcels → one billable trace
     assert stats1["cached"] == 1 or calls["n"] == 1
+
+
+# ── Optional secrets (graceful degradation) ────────────────────────────
+
+def test_no_batchdata_key_still_advances_leads(db, monkeypatch):
+    """Without BATCHDATA_API_KEY, qualified leads must still reach review."""
+    from seller_finder.skiptrace import tracer
+    from seller_finder import review
+
+    _insert_parcel(db, prop_id="5001", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "5001", "kind": "mortgage",
+                         "doc_number": "1", "month": 8, "year": 2026}], [], {})
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "")
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    stats = tracer.trace_qualified_leads(db)
+    assert stats["skipped_no_api_key"] == 1
+    lead = db.execute("SELECT status FROM leads WHERE prop_id='5001'").fetchone()
+    assert lead["status"] == "traced"
+    assert review.stage_traced_leads(db) == 1
+
+
+def test_no_smtp_skips_digest_without_error(db, monkeypatch):
+    from seller_finder import review
+    monkeypatch.setattr(config, "SMTP_USER", "")
+    monkeypatch.setattr(config, "SMTP_PASSWORD", "")
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    assert review.send_digest_email(db) is False  # skipped, no exception
+
+
+def test_no_healthcheck_url_skips_ping(monkeypatch):
+    from seller_finder import health
+    monkeypatch.setattr(config, "HEALTHCHECK_URL", "")
+    health.ping_healthcheck()  # must not raise
 
 
 # ── Review files ─────────────────────────────────────────────────────────
