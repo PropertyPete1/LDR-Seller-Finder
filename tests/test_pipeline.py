@@ -253,6 +253,56 @@ def test_recent_deed_does_not_add_tenure(db):
     assert lead["score"] == config.SCORE_ABSENTEE  # no tenure bump
 
 
+# ── Parcel download mirror ────────────────────────────────────────────
+
+def test_github_token_from_env(monkeypatch):
+    from seller_finder.sources import parcels
+    monkeypatch.setenv("GITHUB_TOKEN", "tok-abc")
+    assert parcels._github_token() == "tok-abc"
+
+
+def test_github_token_from_git_config(monkeypatch):
+    import base64
+    from seller_finder.sources import parcels
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    b64 = base64.b64encode(b"x-access-token:tok-xyz").decode()
+
+    class FakeCompleted:
+        stdout = f"AUTHORIZATION: basic {b64}\n"
+    monkeypatch.setattr(parcels.subprocess, "run", lambda *a, **k: FakeCompleted())
+    assert parcels._github_token() == "tok-xyz"
+
+
+def test_download_falls_back_to_txgio_when_mirror_fails(monkeypatch, tmp_path):
+    from seller_finder.sources import parcels
+    calls = []
+    monkeypatch.setattr(parcels, "_download_from_mirror",
+                        lambda county, zp: calls.append("mirror") or False)
+
+    def fake_txgio(county, cfg, zp):
+        calls.append("txgio")
+        import zipfile
+        gdb = tmp_path / "fake.gdb"; gdb.mkdir()
+        (gdb / "gdb").write_text("x")
+        with zipfile.ZipFile(zp, "w") as z:
+            z.write(gdb / "gdb", "fake.gdb/gdb")
+        return True
+    monkeypatch.setattr(parcels, "_download_from_txgio", fake_txgio)
+    gdb_path = parcels.download_county_gdb("bexar", tmp_path / "dl")
+    assert calls == ["mirror", "txgio"]
+    assert gdb_path.name == "fake.gdb"
+
+
+def test_download_raises_when_all_sources_fail(monkeypatch, tmp_path):
+    import pytest as _pytest
+    from seller_finder.sources import parcels
+    monkeypatch.setattr(parcels, "_download_from_mirror", lambda c, z: False)
+    monkeypatch.setattr(parcels, "_download_from_txgio", lambda c, cfg, z: False)
+    with _pytest.raises(RuntimeError, match="All parcel download sources failed"):
+        parcels.download_county_gdb("bexar", tmp_path / "dl")
+
+
 # ── FUB auto-push ─────────────────────────────────────────────────────────────
 
 def _make_awaiting_lead(db, prop_id, emails="[]", phones="[]", dnc=0, litigator=0,

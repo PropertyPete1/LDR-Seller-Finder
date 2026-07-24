@@ -67,8 +67,26 @@ Neither BCAD (bcad.org) nor Comal AD (comalad.org) offers a self-serve bulk down
 
 - API: `https://api.tnris.org/api/v1/collections?search=land+parcels` → newest "Land Parcels" collection → `/resources?collection_id=…&area_type_name=Bexar` returns the zip URL.
 - Verified: Comal file = 103,537 parcels (tax year 2025) with `OWNER_NAME`, `SITUS_*`, `MAIL_*`, `MKT_VALUE`. Bexar ≈ 710K parcels.
-- Gotcha handled in code: TxGIO's CloudFront blocks default `python-requests`/`curl` user agents; the loader sends a browser-like UA.
 - Refresh cadence is roughly annual. That's fine: parcels change slowly, and the signals that make leads *timely* (foreclosure, divorce, exemption changes) come from feeds that update monthly/weekly.
+
+#### Parcel data mirror — why and how (IMPORTANT)
+
+**TxGIO's CloudFront blocks GitHub Actions datacenter IPs at the IP level** — confirmed in live Actions runs (403 on both county zips regardless of user agent or retries; the same download works from residential networks). No official alternate endpoint exists: the api.tnris.org resource URLs all point at the same CloudFront distribution, and no public S3 origin is exposed.
+
+So the pipeline downloads parcel zips in this order:
+
+1. **PRIMARY — GitHub Release mirror**: the same CC0 zips are attached as assets to this repo's [`parcel-data-2025` release](https://github.com/PropertyPete1/LDR-Seller-Finder/releases/tag/parcel-data-2025) (`bexar_parcels.zip`, `comal_parcels.zip`). github.com is always reachable from Actions runners. Auth uses `GITHUB_TOKEN`/`GH_TOKEN` if set, otherwise the credentials `actions/checkout` persists in `.git/config` — so **no workflow changes were needed**.
+2. **FALLBACK — TxGIO direct**: the original download path (browser UA + retries), which works from residential/office IPs and covers the case where a mirror asset is missing.
+
+**Quarterly refresh process** (parcel data changes slowly — set a calendar reminder for Jan/Apr/Jul/Oct, or just refresh when TxGIO publishes a new StratMap vintage):
+
+```bash
+# From your own computer (home/office network — NOT a datacenter/VPS):
+git clone https://github.com/PropertyPete1/LDR-Seller-Finder && cd LDR-Seller-Finder
+bash scripts/refresh_parcel_mirror.sh   # downloads fresh zips from TxGIO, replaces the release assets
+```
+
+The script auto-detects the newest TxGIO Land Parcels collection, verifies each zip, and uploads with `--clobber`. When TxGIO publishes a new vintage (e.g. StratMap 2026), bump `MIRROR_TAG` in `src/seller_finder/sources/parcels.py` and `TAG` in the script to `parcel-data-2026`, create the new release, and run the script. Adding a new county? Add its zip to the same release as `{county}_parcels.zip` (the refresh script picks up counties from its `COUNTIES` map).
 
 If you ever want CAD-direct data (fresher, includes deed dates): email **openrecords@bcad.org** — BCAD provides its full appraisal export via FTP for free (current year). Comal AD takes open-records requests at their office/email; no standing export exists.
 
@@ -147,9 +165,10 @@ LDR-Seller-Finder/
 │       └── tracer.py             # Cache-aware, budget-capped orchestration
 ├── scripts/
 │   ├── import_deed_dates.py      # One-off deed-date import (or use data/inbox/)
+│   ├── refresh_parcel_mirror.sh  # Quarterly parcel-mirror refresh (run from home network)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 28 unit tests
+├── tests/test_pipeline.py        # 32 unit tests
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
@@ -228,7 +247,7 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 ## Adding a New County (Travis, DFW, Houston…)
 
 1. Add the county name to `counties` in `config/settings.yaml`.
-2. Add a `parcel_sources` block with its TxGIO `area_type_name` (Travis, Dallas, Tarrant, Harris — FIPS 48453, 48113, 48439, 48201). TxGIO covers all Texas counties, so parcels + absentee detection work everywhere with zero code changes.
+2. Add a `parcel_sources` block with its TxGIO `area_type_name` (Travis, Dallas, Tarrant, Harris — FIPS 48453, 48113, 48439, 48201). TxGIO covers all Texas counties, so parcels + absentee detection work everywhere with zero code changes. Also add the county's zip to the `parcel-data-2025` release (add it to `COUNTIES` in `scripts/refresh_parcel_mirror.sh` and run the script) so Actions can download it.
 3. Optional: if the county publishes exemption or foreclosure ArcGIS/REST feeds, add `exemption_sources` / `foreclosure_sources` entries (find them the way we found Bexar's — check the county clerk's GIS/foreclosure map page and inspect its network calls).
 4. Scoring, tracing, staging, and FUB push need no changes.
 
