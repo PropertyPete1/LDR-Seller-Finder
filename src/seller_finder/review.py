@@ -33,7 +33,7 @@ def stage_traced_leads(conn) -> int:
     return cur.rowcount
 
 
-def write_review_files(conn) -> dict:
+def write_review_files(conn, run_stats: dict | None = None) -> dict:
     """Write pending_leads.csv (push record) and run_summary.md. Returns stats.
 
     The CSV records every lead touched in the last 24h push cycle plus anything
@@ -73,7 +73,7 @@ def write_review_files(conn) -> dict:
     stats = _summary_stats(conn)
     md_path = config.REVIEW_DIR / "run_summary.md"
     with open(md_path, "w") as f:
-        f.write(render_summary_md(stats, len(rows)))
+        f.write(render_summary_md(stats, len(rows), run_stats=run_stats))
     LOGGER.info("Review files written: %s (%d pending leads)", csv_path, len(rows))
     return {"pending": len(rows), "csv": str(csv_path), "summary": str(md_path), **stats}
 
@@ -85,11 +85,17 @@ def _summary_stats(conn) -> dict:
 
     week_ago = (dt.datetime.now(config.CT) - dt.timedelta(days=7)).isoformat()
     day_ago = (dt.datetime.now(config.CT) - dt.timedelta(hours=24)).isoformat()
+    # "This run" = every qualified lead handled in the last 24h, whatever its
+    # outcome (pushed / held for no contact info / awaiting a push retry).
+    # NOTE: held_no_contact MUST be counted — an earlier version omitted it,
+    # so runs without a BatchData key reported 0 in every band despite
+    # finding qualified leads.
+    handled = ("((status IN ('pushed','held_no_contact') AND updated_at>=?) "
+               "OR status IN ('awaiting_approval','qualified','traced'))")
     buckets = {}
     for lo, hi in ((40, 54), (55, 69), (70, 84), (85, 100)):
         buckets[f"{lo}-{hi}"] = one(
-            "SELECT COUNT(*) FROM leads WHERE score BETWEEN ? AND ? "
-            "AND ((status='pushed' AND updated_at>=?) OR status='awaiting_approval')",
+            f"SELECT COUNT(*) FROM leads WHERE score BETWEEN ? AND ? AND {handled}",
             lo, hi, day_ago,
         )
     return {
@@ -103,15 +109,74 @@ def _summary_stats(conn) -> dict:
         "score_buckets": buckets,
         "by_source": {
             r["primary_source"]: r["n"] for r in conn.execute(
-                "SELECT primary_source, COUNT(*) n FROM leads "
-                "WHERE (status='pushed' AND updated_at>=?) OR status='awaiting_approval' "
+                f"SELECT primary_source, COUNT(*) n FROM leads WHERE {handled} "
                 "GROUP BY primary_source", (day_ago,)
             )
+        },
+        "by_signal_combo": {
+            r["combo"]: r["n"] for r in conn.execute(
+                f"""SELECT combo, COUNT(*) n FROM (
+                      SELECT (SELECT group_concat(je.value ->> '$.signal', ' + ')
+                              FROM json_each(l.signals) je) AS combo
+                      FROM leads l WHERE {handled}
+                   ) GROUP BY combo ORDER BY n DESC""", (day_ago,)
+            ) if r["combo"]
         },
     }
 
 
-def render_summary_md(stats: dict, pending: int) -> str:
+def _diagnostics_md(run_stats: dict | None) -> list[str]:
+    """Per-source pipeline diagnostics — makes silent failures visible at a
+    glance (e.g. a blocked parcel download shows rows=0 right in the summary)."""
+    if not run_stats:
+        return []
+    lines = ["", "## Pipeline diagnostics (this run)", "",
+             "| Stage | County | Result |", "|---|---|---|"]
+    for county, c in (run_stats.get("counties") or {}).items():
+        p = c.get("parcels") or {}
+        if "error" in p:
+            lines.append(f"| Parcels | {county} | ❌ ERROR: {p['error'][:120]} |")
+        else:
+            lines.append(
+                f"| Parcels | {county} | rows {p.get('rows', 0):,} → kept "
+                f"{p.get('kept', 0):,} → absentee {p.get('absentee', 0):,} "
+                f"(owner changes {p.get('owner_changes', 0)}) |")
+        ex = c.get("exemptions")
+        if ex is not None:
+            lines.append(
+                f"| Exemptions | {county} | {ex.get('updated', 0):,} rows, homestead "
+                f"{ex.get('homestead', 0):,} |")
+        fc = c.get("preforeclosure")
+        if fc is not None:
+            lines.append(
+                f"| Pre-foreclosure | {county} | {fc.get('notices', 0)} notices → "
+                f"{fc.get('matched', 0)} matched to parcels |")
+    dv = run_stats.get("divorce") or {}
+    lines.append(f"| Divorce | bexar | {dv.get('filings', 0)} filings → "
+                 f"{dv.get('matched', 0)} matched (stubbed source) |")
+    de = run_stats.get("deeds") or {}
+    lines.append(f"| Deed dates | — | {de.get('files', 0)} inbox files, "
+                 f"{de.get('rows', 0):,} rows |")
+    sc = run_stats.get("scoring") or {}
+    lines.append(
+        f"| Scoring | all | candidates {sc.get('candidates', 0):,} → qualified "
+        f"{sc.get('qualified', 0):,} (below threshold {sc.get('below_threshold', 0):,}) |")
+    st = run_stats.get("skiptrace") or {}
+    lines.append(
+        f"| Skip trace | all | eligible {st.get('eligible', 0)}, cached "
+        f"{st.get('cached', 0)}, traced {st.get('traced', 0)}, matched "
+        f"{st.get('matched', 0)}, no-key-skipped {st.get('skipped_no_api_key', 0)} |")
+    fp = run_stats.get("fub_push") or {}
+    if "error" in fp:
+        lines.append(f"| FUB push | all | ❌ ERROR: {str(fp['error'])[:120]} |")
+    else:
+        lines.append(
+            f"| FUB push | all | pushed {fp.get('pushed', 0)}, held (no contact) "
+            f"{fp.get('held_no_contact', 0)}, failed {fp.get('failed', 0)} |")
+    return lines
+
+
+def render_summary_md(stats: dict, pending: int, run_stats: dict | None = None) -> str:
     lines = [
         "# LDR-Seller-Finder — Weekly Run Summary",
         "",
@@ -136,6 +201,11 @@ def render_summary_md(stats: dict, pending: int) -> str:
     lines += ["", "## By source", "", "| Source | Leads |", "|---|---|"]
     for src, n in (stats.get("by_source") or {}).items():
         lines.append(f"| {src} | {n} |")
+    if stats.get("by_signal_combo"):
+        lines += ["", "## By signal combination", "", "| Signals | Leads |", "|---|---|"]
+        for combo, n in stats["by_signal_combo"].items():
+            lines.append(f"| {combo} | {n} |")
+    lines += _diagnostics_md(run_stats)
     lines += [
         "",
         "Qualified, contactable leads were **auto-pushed to Follow Up Boss** at the "
@@ -147,7 +217,7 @@ def render_summary_md(stats: dict, pending: int) -> str:
     return "\n".join(lines)
 
 
-def send_digest_email(conn) -> bool:
+def send_digest_email(conn, run_stats: dict | None = None) -> bool:
     """Weekly digest to Peter: new leads, score breakdown, awaiting approval."""
     stats = _summary_stats(conn)
     subject = (

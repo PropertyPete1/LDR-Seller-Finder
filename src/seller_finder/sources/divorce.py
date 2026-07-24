@@ -127,7 +127,7 @@ def _candidate_owners(conn, party_name: str, limit: int = 25) -> list[dict]:
     # Party names are usually "First Last"; owner names "LAST FIRST".
     rows = conn.execute(
         """SELECT county, prop_id, owner_name, situs_addr, situs_city
-           FROM parcels WHERE owner_name LIKE ? LIMIT ?""",
+           FROM pc.parcels WHERE owner_name LIKE ? LIMIT ?""",
         (f"{surname}%", limit),
     ).fetchall()
     return [dict(r) for r in rows]

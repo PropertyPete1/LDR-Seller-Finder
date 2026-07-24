@@ -34,7 +34,7 @@ from pathlib import Path
 import requests
 
 from .. import config
-from ..state import now_iso
+from ..state import now_iso, owner_hash
 
 LOGGER = logging.getLogger("sources.parcels")
 
@@ -312,10 +312,12 @@ def read_gdb_rows(gdb_path: Path):
 
 
 def sync_county(conn, county: str, gdb_path: Path | None = None) -> dict:
-    """Sync one county's parcels into the state DB.
+    """Load one county's parcels into the EPHEMERAL cache (pc.parcels).
 
-    Records owner changes in owner_history (our proxy for resale/deed date
-    going forward) and flags absentee owners. Returns stats.
+    The full snapshot is never committed — it is rebuilt from the mirror
+    download every run. Persistent, compact derived state is maintained in
+    the committed DB: owners_first_seen (tenure proxy + owner-change
+    detection for absentee parcels) and owner_history (change audit log).
     """
     if gdb_path is None:
         gdb_path = download_county_gdb(county, config.DATA_DIR / "downloads")
@@ -325,12 +327,15 @@ def sync_county(conn, county: str, gdb_path: Path | None = None) -> dict:
     ts = now_iso()
     stats = {"county": county, "rows": 0, "kept": 0, "absentee": 0, "owner_changes": 0, "new": 0}
 
-    existing = {
-        row["prop_id"]: row["owner_name"]
-        for row in conn.execute("SELECT prop_id, owner_name FROM parcels WHERE county=?", (county,))
+    # Compact persistent owner identity for absentee parcels (committed DB).
+    known_owners = {
+        row["prop_id"]: row["owner_hash"]
+        for row in conn.execute(
+            "SELECT prop_id, owner_hash FROM owners_first_seen WHERE county=?", (county,))
     }
 
-    batch = []
+    conn.execute("DELETE FROM pc.parcels WHERE county=?", (county,))
+    batch, ofs_batch = [], []
     for p in read_gdb_rows(gdb_path):
         stats["rows"] += 1
         if not p["prop_id"] or not p["owner_name"] or not p["situs_addr"]:
@@ -343,45 +348,61 @@ def sync_county(conn, county: str, gdb_path: Path | None = None) -> dict:
         stats["kept"] += 1
         stats["absentee"] += int(absentee)
 
-        prev_owner = existing.get(p["prop_id"])
-        if prev_owner is None:
-            stats["new"] += 1
-        elif prev_owner != p["owner_name"]:
-            stats["owner_changes"] += 1
-            conn.execute(
-                "INSERT INTO owner_history (county, prop_id, owner_name, observed_at) VALUES (?,?,?,?)",
-                (county, p["prop_id"], p["owner_name"], ts),
-            )
+        if absentee:
+            ohash = owner_hash(p["owner_name"])
+            prev_hash = known_owners.get(p["prop_id"])
+            if prev_hash is None:
+                stats["new"] += 1
+                ofs_batch.append((county, p["prop_id"], ohash, ts))
+            elif prev_hash != ohash:
+                stats["owner_changes"] += 1
+                conn.execute(
+                    "INSERT INTO owner_history (county, prop_id, owner_name, observed_at) VALUES (?,?,?,?)",
+                    (county, p["prop_id"], p["owner_name"], ts))
+                conn.execute(
+                    "UPDATE owners_first_seen SET owner_hash=?, first_seen_at=? "
+                    "WHERE county=? AND prop_id=?", (ohash, ts, county, p["prop_id"]))
 
         batch.append((
             county, p["prop_id"], p["owner_name"], p["situs_addr"], p["situs_city"],
             p["situs_zip"], p["mail_addr"], p["mail_city"], p["mail_state"], p["mail_zip"],
-            p["mkt_value"], p["tax_year"], int(absentee), ts, ts,
+            p["mkt_value"], p["tax_year"], int(absentee),
         ))
         if len(batch) >= 5000:
-            _upsert_parcels(conn, batch)
+            _insert_parcels(conn, batch)
             batch = []
+        if len(ofs_batch) >= 5000:
+            _insert_first_seen(conn, ofs_batch)
+            ofs_batch = []
     if batch:
-        _upsert_parcels(conn, batch)
+        _insert_parcels(conn, batch)
+    if ofs_batch:
+        _insert_first_seen(conn, ofs_batch)
     conn.commit()
     LOGGER.info("Parcel sync %s: %s", county, stats)
     return stats
 
 
-def _upsert_parcels(conn, batch):
+def _insert_parcels(conn, batch):
     conn.executemany(
         """
-        INSERT INTO parcels (county, prop_id, owner_name, situs_addr, situs_city,
-                             situs_zip, mail_addr, mail_city, mail_state, mail_zip,
-                             mkt_value, tax_year, is_absentee, first_seen_at, last_seen_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO pc.parcels (county, prop_id, owner_name, situs_addr, situs_city,
+                                situs_zip, mail_addr, mail_city, mail_state, mail_zip,
+                                mkt_value, tax_year, is_absentee)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT (county, prop_id) DO UPDATE SET
             owner_name=excluded.owner_name, situs_addr=excluded.situs_addr,
             situs_city=excluded.situs_city, situs_zip=excluded.situs_zip,
             mail_addr=excluded.mail_addr, mail_city=excluded.mail_city,
             mail_state=excluded.mail_state, mail_zip=excluded.mail_zip,
             mkt_value=excluded.mkt_value, tax_year=excluded.tax_year,
-            is_absentee=excluded.is_absentee, last_seen_at=excluded.last_seen_at
+            is_absentee=excluded.is_absentee
         """,
         batch,
     )
+
+
+def _insert_first_seen(conn, batch):
+    conn.executemany(
+        "INSERT OR IGNORE INTO owners_first_seen (county, prop_id, owner_hash, first_seen_at) "
+        "VALUES (?,?,?,?)", batch)

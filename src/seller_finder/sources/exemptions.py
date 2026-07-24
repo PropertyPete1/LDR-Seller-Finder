@@ -14,6 +14,7 @@ import time
 import requests
 
 from .. import config
+from ..state import now_iso
 
 LOGGER = logging.getLogger("sources.exemptions")
 
@@ -78,7 +79,13 @@ def fetch_exemptions(county: str):
 
 
 def sync_county(conn, county: str) -> dict:
-    """Update parcels.exempts; return stats incl. homestead-removed prop_ids."""
+    """Refresh the compact exempt_parcels snapshot (committed DB); return
+    stats incl. homestead-removed prop_ids.
+
+    exempt_parcels holds only parcels that currently carry exemptions
+    (~405K for Bexar, a few MB) — exactly the derived state needed to diff
+    homestead status between runs without committing raw parcel records.
+    """
     stats = {"county": county, "updated": 0, "homestead": 0, "homestead_removed": []}
     src = config.SETTINGS.get("exemption_sources", {}).get(county)
     if not src:
@@ -87,31 +94,35 @@ def sync_county(conn, county: str) -> dict:
     prev = {
         row["prop_id"]: row["exempts"]
         for row in conn.execute(
-            "SELECT prop_id, exempts FROM parcels WHERE county=? AND exempts IS NOT NULL", (county,)
+            "SELECT prop_id, exempts FROM exempt_parcels WHERE county=?", (county,)
         )
     }
 
+    ts = now_iso()
     seen_hs = set()
-    batch = []
+    current: list[tuple] = []
     for prop_id, exempts in fetch_exemptions(county):
-        batch.append((exempts, county, prop_id))
+        current.append((county, prop_id, exempts, ts))
         if _has_homestead(exempts):
             seen_hs.add(prop_id)
-        if len(batch) >= 5000:
-            conn.executemany(
-                "UPDATE parcels SET exempts=? WHERE county=? AND prop_id=?", batch
-            )
-            stats["updated"] += len(batch)
-            batch = []
-    if batch:
-        conn.executemany("UPDATE parcels SET exempts=? WHERE county=? AND prop_id=?", batch)
-        stats["updated"] += len(batch)
+
+    if not current and prev:
+        # Defensive: an empty feed would mark every parcel homestead-removed.
+        LOGGER.warning("Exemption feed for %s returned 0 rows — keeping previous "
+                       "snapshot, skipping homestead-removed detection", county)
+        return stats
 
     # Homestead removed = previously had HS, current pull says otherwise.
     for prop_id, old_exempts in prev.items():
         if _has_homestead(old_exempts) and prop_id not in seen_hs:
             stats["homestead_removed"].append(prop_id)
 
+    # Replace this county's snapshot with the current pull.
+    conn.execute("DELETE FROM exempt_parcels WHERE county=?", (county,))
+    conn.executemany(
+        "INSERT OR REPLACE INTO exempt_parcels (county, prop_id, exempts, last_seen_at) "
+        "VALUES (?,?,?,?)", current)
+    stats["updated"] = len(current)
     stats["homestead"] = len(seen_hs)
     conn.commit()
     LOGGER.info(

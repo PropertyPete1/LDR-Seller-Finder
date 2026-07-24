@@ -77,7 +77,7 @@ def match_to_parcels(conn, county: str, notices: list[dict]) -> list[dict]:
     # Build lookup of parcel situs addresses for the county.
     lookup: dict[str, dict] = {}
     for row in conn.execute(
-        "SELECT prop_id, owner_name, situs_addr, situs_zip, mail_addr FROM parcels WHERE county=?",
+        "SELECT prop_id, owner_name, situs_addr, situs_zip, mail_addr FROM pc.parcels WHERE county=?",
         (county,),
     ):
         key = _addr_key(row["situs_addr"], row["situs_zip"])

@@ -24,7 +24,7 @@ import sys
 sys.path.insert(0, "src")
 
 from seller_finder import config  # noqa: E402
-from seller_finder.state import get_db, now_iso, record_run  # noqa: E402
+from seller_finder.state import get_db, now_iso, record_run, check_state_size  # noqa: E402
 from seller_finder.sources import parcels, exemptions, preforeclosure, divorce, deeds  # noqa: E402
 from seller_finder.scoring import compute_scores  # noqa: E402
 from seller_finder.skiptrace.tracer import trace_qualified_leads  # noqa: E402
@@ -38,7 +38,9 @@ LOGGER = logging.getLogger("weekly_pull")
 
 def main() -> int:
     started = now_iso()
-    conn = get_db()
+    # fresh_parcels: the parcel snapshot is ephemeral — rebuilt from the
+    # mirror download every run, never committed (GitHub 100MB file limit).
+    conn = get_db(fresh_parcels=True)
     stats: dict = {"counties": {}, "started_at": started, "dry_run": config.DRY_RUN}
     LOGGER.info("=== Weekly pull — DRY_RUN=%s counties=%s ===", config.DRY_RUN, config.COUNTIES)
 
@@ -104,11 +106,14 @@ def main() -> int:
         stats["fub_push"] = {"error": str(exc)}
 
     # 8. Run-record artifacts (CSV documents what was pushed/held)
-    stats["review"] = write_review_files(conn)
+    stats["review"] = write_review_files(conn, run_stats=stats)
 
-    # 9. Digest + heartbeat
-    stats["digest_sent"] = send_digest_email(conn)
+    # 9. Digest + heartbeat + committed-DB size guard
+    stats["digest_sent"] = send_digest_email(conn, run_stats=stats)
     record_run(conn, "weekly_pull", started, stats)
+    conn.commit()
+    conn.close()
+    stats["state_db_mb"] = round(check_state_size(), 1)
     ping_healthcheck()
     LOGGER.info("=== Weekly pull complete: %s ===", {k: v for k, v in stats.items() if k != "counties"})
     return 0

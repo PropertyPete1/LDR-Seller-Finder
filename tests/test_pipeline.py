@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pytest
 
-from seller_finder.state import get_db, owner_key, now_iso
+from seller_finder.state import get_db, owner_key, owner_hash, now_iso
 from seller_finder.sources.parcels import is_absentee, is_individual_owner, normalize_addr
 from seller_finder.sources.preforeclosure import _addr_key
 from seller_finder.scoring import compute_scores
@@ -16,24 +16,28 @@ from seller_finder import config
 
 @pytest.fixture
 def db(tmp_path):
-    conn = get_db(tmp_path / "test.sqlite3")
+    conn = get_db(tmp_path / "test.sqlite3", parcels_cache=tmp_path / "cache.sqlite3")
     yield conn
     conn.close()
 
 
 def _insert_parcel(conn, county="bexar", prop_id="1001", owner="SMITH JOHN",
                    situs="123 MAIN ST", situs_zip="78201", mail="500 OTHER RD",
-                   mail_zip="78209", absentee=1, exempts=None):
+                   mail_zip="78209", absentee=1, first_seen=None):
     conn.execute(
-        """INSERT OR REPLACE INTO parcels
+        """INSERT OR REPLACE INTO pc.parcels
            (county, prop_id, owner_name, situs_addr, situs_city, situs_zip,
             mail_addr, mail_city, mail_state, mail_zip, mkt_value, tax_year,
-            exempts, is_absentee, first_seen_at, last_seen_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            is_absentee)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (county, prop_id, owner, situs, "SAN ANTONIO", situs_zip, mail,
-         "SAN ANTONIO", "TX", mail_zip, 250000, 2025, exempts, absentee,
-         now_iso(), now_iso()),
+         "SAN ANTONIO", "TX", mail_zip, 250000, 2025, absentee),
     )
+    if absentee:
+        conn.execute(
+            "INSERT OR REPLACE INTO owners_first_seen (county, prop_id, owner_hash, first_seen_at) "
+            "VALUES (?,?,?,?)",
+            (county, prop_id, owner_hash(owner), first_seen or now_iso()))
     conn.commit()
 
 
@@ -72,13 +76,18 @@ def test_addr_key_match():
 
 # ── Scoring ──────────────────────────────────────────────────────────────
 
-def test_absentee_only_scores_30(db):
+def test_absentee_only_scores_30_not_persisted(db):
+    """Absentee-only (30 < 40) is counted as a candidate but NOT stored —
+    sub-threshold leads are recomputed from the parcel cache every run, so
+    persisting them would bloat the committed state DB past GitHub's cap."""
     _insert_parcel(db, prop_id="2001", absentee=1)
     stats = compute_scores(db, [], [], {})
     lead = db.execute("SELECT * FROM leads WHERE prop_id='2001'").fetchone()
-    assert lead["score"] == config.SCORE_ABSENTEE
-    assert lead["status"] == "new"  # 30 < 40 threshold
-    assert stats["leads_created"] == 1
+    assert lead is None
+    assert stats["candidates"] == 1
+    assert stats["below_threshold"] == 1
+    assert stats["leads_created"] == 0
+    assert stats["qualified"] == 0
 
 def test_absentee_plus_foreclosure_qualifies(db):
     _insert_parcel(db, prop_id="2002", absentee=1)
@@ -108,10 +117,12 @@ def test_homestead_removed_scoring(db):
 
 def test_signals_stored_as_json(db):
     _insert_parcel(db, prop_id="2005", absentee=1)
-    compute_scores(db, [], [], {})
+    fc = [{"county": "bexar", "prop_id": "2005", "kind": "mortgage",
+           "doc_number": "20260800009", "month": 8, "year": 2026}]
+    compute_scores(db, fc, [], {})
     lead = db.execute("SELECT signals FROM leads WHERE prop_id='2005'").fetchone()
     signals = json.loads(lead["signals"])
-    assert signals[0]["signal"] == "absentee_owner"
+    assert {s["signal"] for s in signals} == {"absentee_owner", "preforeclosure"}
 
 def test_rescore_carries_forward_event_signals(db):
     """A preforeclosure lead must stay qualified on the next weekly run even
@@ -248,9 +259,86 @@ def test_recent_deed_does_not_add_tenure(db):
                "VALUES ('bexar','6003','2025-06-01','test',?)", (now_iso(),))
     db.commit()
     _insert_parcel(db, prop_id="6003", absentee=1)
-    compute_scores(db, [], [], {})
+    stats = compute_scores(db, [], [], {})
+    # absentee(30) + recent deed (no tenure bump) = 30 → below threshold → not stored
     lead = db.execute("SELECT score FROM leads WHERE prop_id='6003'").fetchone()
-    assert lead["score"] == config.SCORE_ABSENTEE  # no tenure bump
+    assert lead is None
+    assert stats["below_threshold"] == 1
+
+
+# ── State DB split / migration / size guard ────────────────────────
+
+def test_legacy_migration_drops_parcels_and_salvages_state(tmp_path):
+    """Opening a pre-split DB (with a committed parcels table) must salvage
+    exemptions + absentee first-seen, drop the heavy table, and purge
+    sub-threshold 'new' leads."""
+    import sqlite3 as _sq
+    legacy = tmp_path / "legacy.sqlite3"
+    c = _sq.connect(str(legacy))
+    c.executescript("""
+        CREATE TABLE parcels (
+            county TEXT, prop_id TEXT, owner_name TEXT, situs_addr TEXT,
+            situs_city TEXT, situs_zip TEXT, mail_addr TEXT, mail_city TEXT,
+            mail_state TEXT, mail_zip TEXT, mkt_value REAL, tax_year INTEGER,
+            exempts TEXT, is_absentee INTEGER, first_seen_at TEXT,
+            last_seen_at TEXT, PRIMARY KEY (county, prop_id));
+        CREATE TABLE leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, county TEXT, prop_id TEXT,
+            owner_name TEXT, property_addr TEXT, mail_addr TEXT,
+            score INTEGER DEFAULT 0, signals TEXT, primary_source TEXT,
+            status TEXT DEFAULT 'new', skip_trace_id INTEGER,
+            fub_person_id TEXT, notes TEXT, created_at TEXT, updated_at TEXT,
+            UNIQUE (county, prop_id));
+    """)
+    c.execute("INSERT INTO parcels VALUES ('bexar','P1','SMITH JOHN','1 A ST','SA','78201',"
+              "'9 B RD','SA','TX','78209',100000,2025,'HS',1,'2015-01-01','2026-01-01')")
+    c.execute("INSERT INTO parcels VALUES ('bexar','P2','DOE JANE','2 A ST','SA','78201',"
+              "'2 A ST','SA','TX','78201',100000,2025,NULL,0,'2020-01-01','2026-01-01')")
+    c.execute("INSERT INTO leads (county,prop_id,score,status) VALUES ('bexar','P1',30,'new')")
+    c.execute("INSERT INTO leads (county,prop_id,score,status) VALUES ('bexar','P3',60,'qualified')")
+    c.commit(); c.close()
+
+    conn = get_db(legacy, parcels_cache=tmp_path / "cache.sqlite3")
+    # parcels table dropped from the committed DB
+    assert conn.execute("SELECT name FROM main.sqlite_master WHERE name='parcels'").fetchone() is None
+    # compact attributes salvaged
+    ex = conn.execute("SELECT exempts FROM exempt_parcels WHERE prop_id='P1'").fetchone()
+    assert ex["exempts"] == "HS"
+    fs = conn.execute("SELECT first_seen_at FROM owners_first_seen WHERE prop_id='P1'").fetchone()
+    assert fs["first_seen_at"] == "2015-01-01"
+    assert conn.execute("SELECT 1 FROM owners_first_seen WHERE prop_id='P2'").fetchone() is None
+    # sub-threshold 'new' leads purged; qualified kept
+    assert conn.execute("SELECT 1 FROM leads WHERE prop_id='P1'").fetchone() is None
+    assert conn.execute("SELECT 1 FROM leads WHERE prop_id='P3'").fetchone() is not None
+    conn.close()
+
+
+def test_state_size_guard(tmp_path, monkeypatch):
+    from seller_finder.state import check_state_size
+    small = tmp_path / "small.db"
+    small.write_bytes(b"x" * 1000)
+    assert check_state_size(small) < 1
+    big = tmp_path / "big.db"
+    big.write_bytes(b"x" * 95_000_000)
+    with pytest.raises(RuntimeError, match="100 MB"):
+        check_state_size(big, limit_mb=90)
+
+
+def test_summary_counts_held_leads_in_buckets(db):
+    """Regression: held_no_contact leads must appear in score bands/by-source
+    (a run without a BatchData key previously reported 0 everywhere)."""
+    from seller_finder.review import _summary_stats
+    _insert_parcel(db, prop_id="9001", absentee=1)
+    fc = [{"county": "bexar", "prop_id": "9001", "kind": "mortgage",
+           "doc_number": "20260800077", "month": 8, "year": 2026}]
+    compute_scores(db, fc, [], {})
+    db.execute("UPDATE leads SET status='held_no_contact', updated_at=? WHERE prop_id='9001'",
+               (now_iso(),))
+    db.commit()
+    stats = _summary_stats(db)
+    assert stats["score_buckets"]["55-69"] == 1
+    assert stats["by_source"].get("preforeclosure") == 1
+    assert "absentee_owner + preforeclosure" in stats["by_signal_combo"]
 
 
 # ── Parcel download mirror ────────────────────────────────────────────

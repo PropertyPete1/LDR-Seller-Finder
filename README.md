@@ -37,7 +37,18 @@ Seller lead generation system for Lifestyle Design Realty. Every week it pulls p
 
 The **Push Approved Leads** workflow still exists as a manual fallback: it retries leads that failed to push and re-checks held leads for newly-found contact info.
 
-State (parcels, leads, skip-trace cache, run history) lives in a SQLite database that is AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern used by LDR-Automation-Clean.
+### State persistence — two databases, one committed
+
+State is split across two SQLite files (GitHub rejects committed files over 100 MB, and a full two-county parcel snapshot alone is 200+ MB):
+
+| File | Contents | Lifecycle |
+|---|---|---|
+| `data/seller_finder.sqlite3` | Leads (qualified only), skip-trace cache, run history, divorce cases, deed dates, plus compact derived attributes: `owners_first_seen` (tenure baseline + owner-change detection for absentee parcels) and `exempt_parcels` (homestead diff snapshot) | AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern as LDR-Automation-Clean. Stays ~10 MB for two counties, well under 100 MB even at 5+ counties. A size guard fails the run loudly if it ever approaches the limit |
+| `data/parcels_cache.sqlite3` | The full raw parcel snapshot (`pc.parcels`) | **Ephemeral and gitignored** — rebuilt from the release mirror download on every weekly run and ATTACHed to the main connection, so cross-table joins work transparently. Never committed |
+
+Sub-threshold candidates (e.g. absentee-only at 30 points) are recomputed from the parcel cache each run and are *not* stored — only qualified leads (40+) persist. Opening a pre-split state DB triggers an automatic one-time migration that salvages the compact attributes, drops the heavy parcels table, and VACUUMs.
+
+Every run's job summary ends with a **Pipeline diagnostics** table (parcel rows/kept/absentee per county, foreclosure notices fetched/matched, scoring funnel, skip-trace and push outcomes) so a silent failure in any stage — like a blocked download producing 0 rows — is visible at a glance.
 
 ---
 
@@ -148,7 +159,7 @@ LDR-Seller-Finder/
 ├── config/settings.yaml          # Scoring weights, county sources, budgets — edit freely
 ├── src/seller_finder/
 │   ├── config.py                 # Env secrets + settings loader
-│   ├── state.py                  # SQLite schema (parcels, leads, skip_traces, runs…)
+│   ├── state.py                  # Split-DB SQLite schema, legacy migration, size guard
 │   ├── scoring.py                # 0–100 scoring engine
 │   ├── fub.py                    # Follow Up Boss push: dedupe, tags, notes
 │   ├── review.py                 # Review CSV, run summary, weekly digest email
@@ -168,7 +179,7 @@ LDR-Seller-Finder/
 │   ├── refresh_parcel_mirror.sh  # Quarterly parcel-mirror refresh (run from home network)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 32 unit tests
+├── tests/test_pipeline.py        # 35 unit tests
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
@@ -267,7 +278,7 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ```bash
 pip install -r requirements.txt pytest
-python3 -m pytest tests/ -v          # 16 unit tests (scoring, dedupe, matching, staging)
+python3 -m pytest tests/ -v          # 35 unit tests (scoring, dedupe, matching, migration, size guard)
 DRY_RUN=true python3 scripts/e2e_live_test.py   # live smoke test, zero spend
 ```
 
