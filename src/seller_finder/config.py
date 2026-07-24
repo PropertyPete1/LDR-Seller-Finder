@@ -26,12 +26,18 @@ FUB_API_KEY = os.environ.get("FUB_API_KEY", "")
 BATCHDATA_API_KEY = os.environ.get("BATCHDATA_API_KEY", "")
 HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", os.environ.get("SMTP_PASS", ""))
-EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
-OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "peter@lifestyledesignrealty.com")
+# GitHub Actions sets env vars to "" when the secret is missing, so treat
+# empty strings as unset and fall back to sensible defaults.
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name) or default
+
+
+SMTP_HOST = _env("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(_env("SMTP_PORT", "587"))
+SMTP_USER = _env("SMTP_USER")
+SMTP_PASSWORD = _env("SMTP_PASSWORD", _env("SMTP_PASS"))
+EMAIL_FROM = _env("EMAIL_FROM", SMTP_USER)
+OWNER_EMAIL = _env("OWNER_EMAIL", "peter@lifestyledesignrealty.com")
 
 # ── Behavior flags ───────────────────────────────────────────────────────
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
