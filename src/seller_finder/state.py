@@ -11,6 +11,7 @@ Tables:
   leads          — scored leads, lifecycle: new → qualified → traced → approved → pushed
   skip_traces    — cached skip-trace results so an owner is never traced twice
   divorce_cases  — divorce filings pulled by the (stubbed) divorce module
+  deed_dates     — deed/purchase dates (BCAD export import) for the tenure signal
   runs           — run log for the weekly digest
 """
 import datetime as dt
@@ -94,6 +95,15 @@ CREATE TABLE IF NOT EXISTS divorce_cases (
     matched_county  TEXT,
     match_confidence REAL,
     created_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS deed_dates (
+    county          TEXT NOT NULL,
+    prop_id         TEXT NOT NULL,
+    deed_date       TEXT,               -- ISO YYYY-MM-DD (most recent conveyance)
+    source          TEXT,               -- e.g. bcad_export | manual_csv
+    imported_at     TEXT,
+    PRIMARY KEY (county, prop_id)
 );
 
 CREATE TABLE IF NOT EXISTS runs (

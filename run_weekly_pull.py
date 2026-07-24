@@ -6,7 +6,8 @@ Steps:
   2. Sync homestead exemptions (Bexar ArcGIS) and detect removals.
   3. Fetch pre-foreclosure notices and match to parcels.
   4. Ingest divorce filings (stubbed source / CSV inbox) and fuzzy-match owners.
-  5. Score all leads; qualify at threshold.
+  5. Ingest deed-date CSVs from data/inbox/ (BCAD export → tenure signal), then
+     score all leads; qualify at threshold.
   6. Skip-trace qualified leads (cached, budgeted).
   7. Stage traced leads for approval + write review CSV / run summary.
   8. Send weekly digest email; ping healthchecks.io.
@@ -20,7 +21,7 @@ sys.path.insert(0, "src")
 
 from seller_finder import config  # noqa: E402
 from seller_finder.state import get_db, now_iso, record_run  # noqa: E402
-from seller_finder.sources import parcels, exemptions, preforeclosure, divorce  # noqa: E402
+from seller_finder.sources import parcels, exemptions, preforeclosure, divorce, deeds  # noqa: E402
 from seller_finder.scoring import compute_scores  # noqa: E402
 from seller_finder.skiptrace.tracer import trace_qualified_leads  # noqa: E402
 from seller_finder.review import stage_traced_leads, write_review_files, send_digest_email  # noqa: E402
@@ -79,7 +80,11 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Divorce module failed: %s", exc)
 
-    # 5. Scoring
+    # 5. Deed dates (BCAD export inbox → tenure signal), then scoring
+    try:
+        stats["deeds"] = deeds.ingest_inbox(conn)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("Deed ingest failed: %s", exc)
     stats["scoring"] = compute_scores(conn, foreclosure_matches, divorce_matches, homestead_removed)
 
     # 6. Skip trace (cost-guarded)

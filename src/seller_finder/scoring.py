@@ -49,6 +49,7 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
                 candidates[key] = dict(row)
 
     ts = now_iso()
+    event_retention_days = int(config.SETTINGS.get("event_signal_retention_days", 120))
     for key, p in candidates.items():
         county, prop_id = key
         signals = []
@@ -87,9 +88,18 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
         qualified = score >= config.SCORE_THRESHOLD
 
         existing = conn.execute(
-            "SELECT id, status, score FROM leads WHERE county=? AND prop_id=?", key
+            "SELECT id, status, score, signals, updated_at FROM leads WHERE county=? AND prop_id=?", key
         ).fetchone()
         if existing:
+            # Event signals (preforeclosure/divorce) come from weekly feeds that
+            # only cover the current window. If this run didn't re-observe the
+            # event, carry the stored signal forward for a retention period so
+            # a qualified lead isn't silently demoted between runs.
+            current_kinds = {s["signal"] for s in signals}
+            score, signals = _carry_forward_events(
+                existing, signals, score, current_kinds, event_retention_days)
+            qualified = score >= config.SCORE_THRESHOLD
+            primary = _primary_source(signals)
             # Never demote pushed/approved leads; refresh score + signals otherwise.
             new_status = existing["status"]
             if existing["status"] in ("new", "qualified", "skipped"):
@@ -117,6 +127,28 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
     return stats
 
 
+def _carry_forward_events(existing, signals, score, current_kinds, retention_days):
+    """Merge stored event signals into this run's signals (see compute_scores)."""
+    import datetime as _dt
+    try:
+        stored = json.loads(existing["signals"] or "[]")
+    except (ValueError, TypeError):
+        return score, signals
+    try:
+        age_days = (_dt.date.today()
+                    - _dt.date.fromisoformat((existing["updated_at"] or "")[:10])).days
+    except ValueError:
+        age_days = 0
+    if age_days > retention_days:
+        return score, signals
+    for s in stored:
+        if s.get("signal") in ("preforeclosure", "divorce_filing") \
+                and s["signal"] not in current_kinds:
+            signals.append(s)
+            score += int(s.get("points", 0))
+    return score, signals
+
+
 def _primary_source(signals: list[dict]) -> str:
     """Pick the source tag: strongest non-absentee signal wins, else absentee."""
     kinds = {s["signal"] for s in signals}
@@ -137,7 +169,7 @@ def _owned_ten_plus_years(conn, county: str, prop_id: str, first_seen_at: str) -
     """
     row = conn.execute(
         "SELECT deed_date FROM deed_dates WHERE county=? AND prop_id=?", (county, prop_id)
-    ).fetchone() if _deed_table_exists(conn) else None
+    ).fetchone()
     if row and row["deed_date"]:
         try:
             deed = dt.date.fromisoformat(row["deed_date"][:10])
@@ -158,8 +190,3 @@ def _owned_ten_plus_years(conn, county: str, prop_id: str, first_seen_at: str) -
     except ValueError:
         return False
 
-
-def _deed_table_exists(conn) -> bool:
-    return bool(conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='deed_dates'"
-    ).fetchone())

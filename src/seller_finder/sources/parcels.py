@@ -104,6 +104,17 @@ def _clean(val) -> str:
     return "" if s.upper() in ("NULL", "NONE", "NAN") else " ".join(s.split())
 
 
+def _street_only(addr: str) -> str:
+    """Some county files (e.g. Bexar) embed ', CITY, TX ZIP' inside the address
+    fields. Return just the street portion so addresses render/dedupe cleanly."""
+    s = _clean(addr)
+    if "," in s:
+        head = s.split(",")[0].strip()
+        if head:
+            return head
+    return s
+
+
 def normalize_addr(addr: str) -> str:
     """Normalize an address string for comparison (absentee detection)."""
     s = _clean(addr).upper()
@@ -156,13 +167,14 @@ def read_gdb_rows(gdb_path: Path):
 
     n = len(field_data[0]) if len(field_data) else 0
     for r in range(n):
+        situs_city = _clean(col(r, "SITUS_CITY"))
         yield {
             "prop_id": _clean(col(r, "PROP_ID")),
             "owner_name": _clean(col(r, "OWNER_NAME")),
-            "situs_addr": _clean(col(r, "SITUS_ADDR")),
-            "situs_city": _clean(col(r, "SITUS_CITY")),
+            "situs_addr": _street_only(col(r, "SITUS_ADDR")),
+            "situs_city": situs_city,
             "situs_zip": _clean(col(r, "SITUS_ZIP")),
-            "mail_addr": _clean(col(r, "MAIL_ADDR")),
+            "mail_addr": _street_only(col(r, "MAIL_ADDR")),
             "mail_city": _clean(col(r, "MAIL_CITY")),
             "mail_state": _clean(col(r, "MAIL_STAT")),
             "mail_zip": _clean(col(r, "MAIL_ZIP")),

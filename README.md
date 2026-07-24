@@ -44,7 +44,7 @@ State (parcels, leads, skip-trace cache, run history) lives in a SQLite database
 | Absentee owner | +30 | ✅ Live | Owner mailing address ≠ property address (normalized street + ZIP comparison) |
 | Pre-foreclosure notice | +30 | ✅ Live (Bexar) | Notice of Trustee Sale from the County Clerk's public feed, matched to the parcel by address |
 | Divorce filing match | +25 | ⚠️ Stubbed (see below) | Party name fuzzy-matched to parcel owner using Claude (`claude-sonnet-4-6`) |
-| Owned 10+ years | +20 | ⚠️ Needs deed data (see below) | Deed date from imported BCAD export, or 10 years of unchanged ownership in our own history |
+| Owned 10+ years | +20 | ⚠️ Wired — auto-ingests from `data/inbox/` (see below) | Deed date from the free BCAD export (one open-records email), or 10 years of unchanged ownership in our own history |
 | Homestead exemption removed | +10 | ✅ Live (Bexar) | `HS` code present in the previous pull, missing in the current one |
 
 Leads scoring **40 or higher** are skip-traced and staged for approval. Weights and the threshold are tunable in `config/settings.yaml` — no code changes needed.
@@ -102,12 +102,18 @@ Per project policy, we **stub rather than build a fragile scraper**. However, th
 | **Standing open-records request** to the Bexar District Clerk ([records request page](https://www.bexar.org/3500/Public-Records-Requests)) for a weekly list of new family-case filings | One email + weekly CSV drop | Free/small copy fee | Many Texas clerks fulfill standing requests as spreadsheets |
 | **Lead vendors** (CourthouseDirect, Foreclosures Daily) | CSV drop only | Per-list | Same CSV inbox path |
 
-### 5. "Owned 10+ years" — ⚠️ PARTIAL (no free bulk deed dates)
+### 5. "Owned 10+ years" — ⚠️ WIRED, awaiting deed data (one free email unlocks it)
 
-No free bulk source carries deed/purchase dates. Two activation paths, both built:
+**Exhaustively researched (Jul 2026): no free bulk source with deed/purchase dates is directly downloadable.** Ruled out: TxGIO parcels (`DATE_ACQ` is the data-collection date, not deed date), the Bexar County ArcGIS parcel layer (no deed/sale fields — full field list verified), the Texas Comptroller EARS/EPTS appraisal rolls (inbound-only secured SFTP, never published per county), and the County Clerk's deed search at bexar.tx.publicsearch.us (interactive/CAPTCHA-gated site whose bulk export requires an account — and it only lists *new* transfers, the wrong shape for tenure anyway).
 
-1. **BCAD appraisal export** (free open-records request, see above) contains deed records. Extract them and run `python3 scripts/import_deed_dates.py deed_dates.csv` (columns: `county, prop_id, deed_date`). The signal turns on immediately for imported parcels.
-2. **Owner-history proxy**: every weekly run logs owner changes in `owner_history`. Once the system has enough history, unchanged ownership across 10+ years scores automatically.
+**The unlock — one free email:** send an open-records request to **openrecords@bcad.org** asking for the *current appraisal data export* (BCAD delivers it via their FTP, free for current-year data). It contains deed dates for all ~710K Bexar parcels. Comal AD equivalent: open-records request via [comalad.org](https://comalad.org/open-records-request/).
+
+**The pipeline is already fully wired — no code changes needed when the data arrives.** Two activation paths:
+
+1. **Inbox auto-ingest (preferred):** extract `county, prop_id, deed_date` from the export into a CSV named `deeds_*.csv`, drop it in `data/inbox/`, and commit. The next weekly run imports it automatically (files are renamed `*.imported` so they process exactly once), and every parcel with a 10+-year-old deed date immediately scores +20. Dates are accepted as `YYYY-MM-DD`, `MM/DD/YYYY`, `YYYYMMDD`, or bare `YYYY`. Alternatively run `python3 scripts/import_deed_dates.py deed_dates.csv` locally.
+2. **Owner-history proxy (automatic fallback):** every weekly run logs owner changes in `owner_history`; unchanged ownership across 10+ years of accumulated history scores automatically.
+
+**Impact preview (measured on live data):** ~155K Bexar absentee owners currently score 30 — just below the 40 threshold. Deed data promotes every absentee owner with 10+ years of tenure to 50 (qualified), so this one email is the single highest-leverage upgrade available.
 
 ---
 
@@ -129,15 +135,17 @@ LDR-Seller-Finder/
 │   │   ├── parcels.py            # TxGIO bulk parcel loader (Bexar, Comal)
 │   │   ├── exemptions.py         # Bexar homestead exemptions + removal detection
 │   │   ├── preforeclosure.py     # Bexar Notice of Trustee Sale feed
+│   │   ├── deeds.py              # Deed-date inbox auto-ingest (tenure signal)
 │   │   └── divorce.py            # STUB + CSV inbox + Claude fuzzy matching (live)
 │   └── skiptrace/
 │       ├── base.py               # Provider interface (SkipTraceProvider)
 │       ├── batchdata.py          # BatchData implementation
 │       └── tracer.py             # Cache-aware, budget-capped orchestration
 ├── scripts/
-│   ├── import_deed_dates.py      # Unlocks the owned-10+-years signal
-│   └── e2e_live_test.py          # Live smoke test (dry-run, no spend)
-├── tests/test_pipeline.py        # 16 unit tests
+│   ├── import_deed_dates.py      # One-off deed-date import (or use data/inbox/)
+│   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
+│   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
+├── tests/test_pipeline.py        # 23 unit tests
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron
     ├── workflows/push-approved.yml   # Manual trigger only

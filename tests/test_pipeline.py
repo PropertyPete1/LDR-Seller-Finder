@@ -113,6 +113,21 @@ def test_signals_stored_as_json(db):
     signals = json.loads(lead["signals"])
     assert signals[0]["signal"] == "absentee_owner"
 
+def test_rescore_carries_forward_event_signals(db):
+    """A preforeclosure lead must stay qualified on the next weekly run even
+    if the notice has rotated out of the current-month feed."""
+    _insert_parcel(db, prop_id="2007", absentee=1)
+    fc = [{"county": "bexar", "prop_id": "2007", "kind": "mortgage",
+           "doc_number": "20260800002", "month": 8, "year": 2026}]
+    compute_scores(db, fc, [], {})
+    # Next weekly run: no foreclosure matches passed in
+    compute_scores(db, [], [], {})
+    lead = db.execute("SELECT * FROM leads WHERE prop_id='2007'").fetchone()
+    assert lead["score"] == config.SCORE_ABSENTEE + config.SCORE_PREFORECLOSURE
+    assert lead["status"] == "qualified"
+    assert lead["primary_source"] == "preforeclosure"
+
+
 def test_rescore_does_not_demote_pushed(db):
     _insert_parcel(db, prop_id="2006", absentee=1)
     compute_scores(db, [{"county": "bexar", "prop_id": "2006", "kind": "mortgage",
@@ -188,6 +203,54 @@ def test_no_healthcheck_url_skips_ping(monkeypatch):
     from seller_finder import health
     monkeypatch.setattr(config, "HEALTHCHECK_URL", "")
     health.ping_healthcheck()  # must not raise
+
+
+# ── Deed dates / tenure signal ────────────────────────────────────────────
+
+def test_deed_date_parsing():
+    from seller_finder.sources.deeds import parse_deed_date
+    assert parse_deed_date("2012-05-01") == "2012-05-01"
+    assert parse_deed_date("5/1/2012") == "2012-05-01"
+    assert parse_deed_date("20120501") == "2012-05-01"
+    assert parse_deed_date("2012") == "2012-07-01"
+    assert parse_deed_date("") is None
+    assert parse_deed_date("not a date") is None
+
+
+def test_deed_inbox_ingest_and_tenure_scoring(db, tmp_path, monkeypatch):
+    from seller_finder.sources import deeds
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "deeds_bexar.csv").write_text(
+        "county,prop_id,deed_date\nbexar,6001,2009-03-15\nbexar,6002,not-a-date\n"
+    )
+    stats = deeds.ingest_inbox(db)
+    assert stats["files"] == 1 and stats["rows"] == 1
+    assert (inbox / "deeds_bexar.csv.imported").exists()
+    # Re-running must not re-import
+    stats2 = deeds.ingest_inbox(db)
+    assert stats2["files"] == 0
+
+    # Tenure signal: absentee (30) + owned 10+ years (20) = 50 → qualified
+    _insert_parcel(db, prop_id="6001", absentee=1)
+    compute_scores(db, [], [], {})
+    lead = db.execute("SELECT * FROM leads WHERE prop_id='6001'").fetchone()
+    assert lead["score"] == config.SCORE_ABSENTEE + config.SCORE_LONG_OWNERSHIP
+    assert lead["status"] == "qualified"
+    signals = [s["signal"] for s in json.loads(lead["signals"])]
+    assert "owned_10_plus_years" in signals
+
+
+def test_recent_deed_does_not_add_tenure(db):
+    db.execute("INSERT OR REPLACE INTO deed_dates (county, prop_id, deed_date, source, imported_at) "
+               "VALUES ('bexar','6003','2025-06-01','test',?)", (now_iso(),))
+    db.commit()
+    _insert_parcel(db, prop_id="6003", absentee=1)
+    compute_scores(db, [], [], {})
+    lead = db.execute("SELECT score FROM leads WHERE prop_id='6003'").fetchone()
+    assert lead["score"] == config.SCORE_ABSENTEE  # no tenure bump
 
 
 # ── Review files ─────────────────────────────────────────────────────────
