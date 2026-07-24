@@ -1,0 +1,55 @@
+# LDR-Seller-Finder settings (non-secret tunables)
+#
+# To add a new county (Travis, DFW, Houston are next):
+#   1. Add its name to `counties`.
+#   2. Add a block under `parcel_sources` with its TxGIO FIPS code
+#      (Travis=48453, Dallas=48113, Tarrant=48439, Harris=48201).
+#   3. If the county publishes an exemption or foreclosure REST service,
+#      add it under `exemption_sources` / `foreclosure_sources`.
+# See README "Adding a New County" for full instructions.
+
+counties:
+  - bexar
+  - comal
+
+scoring:
+  absentee_owner: 30          # mailing address != property address
+  divorce_match: 25           # party name matched to parcel owner
+  preforeclosure_match: 30    # notice of trustee sale on the property
+  owned_10_plus_years: 20     # deed date 10+ years ago (needs deed data)
+  homestead_removed: 10       # homestead exemption present before, gone now
+  skip_trace_threshold: 40    # minimum score to spend money on a trace
+
+# Cost guard: max NEW owners skip-traced per weekly run.
+max_skip_traces_per_run: 200
+
+# TxGIO StratMap land-parcel bulk downloads (CC0, statewide program).
+# collection_id is the "Land Parcels 2025" collection; the loader queries the
+# TxGIO API for the newest collection automatically and falls back to this.
+parcel_sources:
+  txgio_collection_search: "land parcels"
+  bexar:
+    fips: "48029"
+    area_type_name: "Bexar"
+  comal:
+    fips: "48091"
+    area_type_name: "Comal"
+
+# Homestead-exemption lookup (Bexar County ArcGIS parcel layer, Exempts field).
+# Comal has no free exemption feed; module degrades gracefully.
+exemption_sources:
+  bexar:
+    url: "https://maps.bexar.org/arcgis/rest/services/Parcels/MapServer/0/query"
+    prop_id_field: "PropID"
+    exempts_field: "Exempts"
+
+# Pre-foreclosure (Notice of Trustee Sale) sources.
+foreclosure_sources:
+  bexar:
+    mortgage_url: "https://maps.bexar.org/arcgis/rest/services/CC/ForeclosuresProd/MapServer/0/query"
+    tax_url: "https://maps.bexar.org/arcgis/rest/services/CC/ForeclosuresProd/MapServer/1/query"
+
+# Only residential-ish parcels are considered. Parcels whose owner name looks
+# like a government/institutional entity are skipped (see filters in code).
+min_market_value: 40000
+max_market_value: 2500000

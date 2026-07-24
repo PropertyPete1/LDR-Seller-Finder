@@ -1,0 +1,63 @@
+name: "Sync SQLite State (Encrypted)"
+description: "Pull/push the SQLite state DB from/to the 'state' branch with AES-256 encryption (same pattern as LDR-Automation-Clean)"
+inputs:
+  mode:
+    description: "'pull' to fetch and decrypt state, 'push' to encrypt and commit state"
+    required: true
+  github_token:
+    description: "GitHub token for pushing"
+    required: true
+  encryption_key:
+    description: "AES-256 passphrase for encrypting/decrypting the state DB"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Pull and decrypt state from 'state' branch
+      if: inputs.mode == 'pull'
+      shell: bash
+      env:
+        STATE_KEY: ${{ inputs.encryption_key }}
+      run: |
+        git fetch origin state:state 2>/dev/null || true
+        if git show state:data/seller_finder.sqlite3.enc > /dev/null 2>&1; then
+          mkdir -p data
+          git show state:data/seller_finder.sqlite3.enc > data/seller_finder.sqlite3.enc
+          openssl enc -aes-256-cbc -pbkdf2 -d \
+            -in data/seller_finder.sqlite3.enc \
+            -out data/seller_finder.sqlite3 \
+            -pass env:STATE_KEY
+          rm -f data/seller_finder.sqlite3.enc
+          echo "✅ State DB pulled and decrypted from 'state' branch"
+          ls -la data/seller_finder.sqlite3
+        else
+          echo "⚠️ No encrypted state DB found on 'state' branch — will start fresh"
+          mkdir -p data
+        fi
+    - name: Encrypt and push state to 'state' branch
+      if: inputs.mode == 'push'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        STATE_KEY: ${{ inputs.encryption_key }}
+      run: |
+        if [ ! -f data/seller_finder.sqlite3 ]; then
+          echo "⚠️ No state DB to push"
+          exit 0
+        fi
+        openssl enc -aes-256-cbc -pbkdf2 \
+          -in data/seller_finder.sqlite3 \
+          -out /tmp/seller_finder.sqlite3.enc \
+          -pass env:STATE_KEY
+        echo "✅ State DB encrypted ($(wc -c < /tmp/seller_finder.sqlite3.enc) bytes)"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin state:state 2>/dev/null || true
+        git checkout state 2>/dev/null || git checkout --orphan state
+        git rm -rf . 2>/dev/null || true
+        mkdir -p data
+        cp /tmp/seller_finder.sqlite3.enc data/seller_finder.sqlite3.enc
+        git add data/seller_finder.sqlite3.enc
+        git commit -m "state: update encrypted SQLite DB [$(date -u +%Y-%m-%dT%H:%M:%SZ)]" --allow-empty
+        git push origin state
+        echo "✅ Encrypted state DB pushed to 'state' branch"

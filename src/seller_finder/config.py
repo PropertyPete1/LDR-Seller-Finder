@@ -1,0 +1,74 @@
+"""Central configuration for LDR-Seller-Finder.
+
+All secrets come from environment variables (GitHub Actions secrets).
+Non-secret tunables live in config/settings.yaml and can be edited without
+touching code.
+"""
+import os
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import yaml
+
+# ── Paths ────────────────────────────────────────────────────────────────
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(REPO_ROOT / "data")))
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(DATA_DIR / "seller_finder.sqlite3")))
+SETTINGS_PATH = Path(os.environ.get("SETTINGS_PATH", str(REPO_ROOT / "config" / "settings.yaml")))
+REVIEW_DIR = Path(os.environ.get("REVIEW_DIR", str(REPO_ROOT / "review")))
+
+# ── Timezone ─────────────────────────────────────────────────────────────
+CT = ZoneInfo("America/Chicago")
+
+# ── Secrets (GitHub Actions secrets → env) ───────────────────────────────
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+FUB_API_KEY = os.environ.get("FUB_API_KEY", "")
+BATCHDATA_API_KEY = os.environ.get("BATCHDATA_API_KEY", "")
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", os.environ.get("SMTP_PASS", ""))
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "peter@lifestyledesignrealty.com")
+
+# ── Behavior flags ───────────────────────────────────────────────────────
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
+
+
+def load_settings() -> dict:
+    """Load non-secret tunables from config/settings.yaml."""
+    if SETTINGS_PATH.exists():
+        with open(SETTINGS_PATH) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+SETTINGS = load_settings()
+
+# Scoring weights (0-100 scale). Overridable in settings.yaml.
+SCORING = SETTINGS.get("scoring", {})
+SCORE_ABSENTEE = SCORING.get("absentee_owner", 30)
+SCORE_DIVORCE = SCORING.get("divorce_match", 25)
+SCORE_PREFORECLOSURE = SCORING.get("preforeclosure_match", 30)
+SCORE_LONG_OWNERSHIP = SCORING.get("owned_10_plus_years", 20)
+SCORE_HOMESTEAD_REMOVED = SCORING.get("homestead_removed", 10)
+SCORE_THRESHOLD = SCORING.get("skip_trace_threshold", 40)
+
+# Counties enabled for this deployment. Add new counties in settings.yaml.
+COUNTIES = SETTINGS.get("counties", ["bexar", "comal"])
+
+# Skip-trace budget guard: max new (never-traced) owners per run.
+MAX_SKIP_TRACES_PER_RUN = int(
+    os.environ.get("MAX_SKIP_TRACES_PER_RUN", SETTINGS.get("max_skip_traces_per_run", 200))
+)
+
+# FUB tags
+TAG_SELLER = "Seller Lead"
+TAG_BY_SOURCE = {
+    "absentee": "County-Absentee",
+    "divorce": "Divorce-Filing",
+    "preforeclosure": "Pre-Foreclosure",
+}

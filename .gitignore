@@ -1,0 +1,12 @@
+# State DB is synced encrypted to the 'state' branch — never commit plaintext
+data/*.sqlite3
+data/*.sqlite3-journal
+data/downloads/
+data/inbox/*.csv
+review/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
