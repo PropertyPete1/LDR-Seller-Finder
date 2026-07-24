@@ -28,8 +28,14 @@ from ..state import now_iso
 LOGGER = logging.getLogger("sources.parcels")
 
 TXGIO_API = "https://api.tnris.org/api/v1"
-# CloudFront in front of TxGIO downloads rejects the default python UA.
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 LDR-Seller-Finder"}
+# CloudFront in front of TxGIO downloads rejects non-browser user agents
+# (verified: the default python UA and custom-suffixed UAs get 403).
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # Owner names that indicate non-individual owners we don't want to mail/call.
 INSTITUTIONAL_RE = re.compile(
@@ -80,10 +86,22 @@ def download_county_gdb(county: str, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     zip_path = dest_dir / f"{county}_parcels.zip"
     LOGGER.info("Downloading %s parcels: %s", county, url)
-    with session.get(url, headers=UA, stream=True, timeout=1800) as dl:
-        dl.raise_for_status()
-        with open(zip_path, "wb") as f:
-            shutil.copyfileobj(dl.raw, f)
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with session.get(url, headers=UA, stream=True, timeout=1800) as dl:
+                dl.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    shutil.copyfileobj(dl.raw, f)
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            LOGGER.warning("Download attempt %d/3 failed for %s: %s", attempt, county, exc)
+            import time
+            time.sleep(10 * attempt)
+    if last_exc is not None:
+        raise last_exc
 
     extract_dir = dest_dir / f"{county}_parcels"
     if extract_dir.exists():
