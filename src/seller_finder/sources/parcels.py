@@ -38,6 +38,9 @@ from ..state import now_iso, owner_hash
 
 LOGGER = logging.getLogger("sources.parcels")
 
+# Populated by _download_from_mirror: county -> "{asset_id}:{size}".
+_LAST_ASSET_KEY: dict = {}
+
 TXGIO_API = "https://api.tnris.org/api/v1"
 MIRROR_REPO = "PropertyPete1/LDR-Seller-Finder"
 MIRROR_TAG = "parcel-data-2025"
@@ -127,6 +130,9 @@ def _download_from_mirror(county: str, zip_path: Path) -> bool:
         if not asset:
             LOGGER.warning("Mirror: release %s has no asset %s_parcels.zip", MIRROR_TAG, county)
             return False
+        # Asset key = id:size — lets daily runs detect an unchanged snapshot
+        # and skip the expensive owner-change bookkeeping (light sync).
+        _LAST_ASSET_KEY[county] = f"{asset['id']}:{asset['size']}"
         LOGGER.info("Downloading %s parcels from mirror release %s (%.0f MB)",
                     county, MIRROR_TAG, asset["size"] / 1e6)
         dl_headers = {**headers, "Accept": "application/octet-stream"}
@@ -261,10 +267,19 @@ def normalize_addr(addr: str) -> str:
 
 
 def is_absentee(situs_addr: str, situs_zip: str, mail_addr: str, mail_zip: str) -> bool:
-    """Absentee = mailing address does not match the property address."""
+    """Absentee = mailing address does not match the property address.
+
+    Guard: a situs without a leading street number (e.g. Travis publishes
+    ', TX 78704' for ~85% of rows) cannot be compared — return False so we
+    never claim absentee on missing data (this false-positived nearly the
+    entire Travis county file before the guard).
+    """
     situs = normalize_addr(situs_addr)
     mail = normalize_addr(mail_addr)
     if not situs or not mail:
+        return False
+    # Situs must look like a real street address (leading house number).
+    if not re.match(r"^\d+\s", situs):
         return False
     # Compare street-number + first street token; zips are a strong tiebreak.
     if situs_zip and mail_zip and situs_zip[:5] != mail_zip[:5]:
@@ -311,24 +326,40 @@ def read_gdb_rows(gdb_path: Path):
         }
 
 
-def sync_county(conn, county: str, gdb_path: Path | None = None) -> dict:
+def sync_county(conn, county: str, gdb_path: Path | None = None,
+                light: bool = False) -> dict:
     """Load one county's parcels into the EPHEMERAL cache (pc.parcels).
 
     The full snapshot is never committed — it is rebuilt from the mirror
     download every run. Persistent, compact derived state is maintained in
     the committed DB: owners_first_seen (tenure proxy + owner-change
     detection for absentee parcels) and owner_history (change audit log).
+
+    light=True (daily runs): when the mirror asset is UNCHANGED since the
+    last sync (same release asset id+size), skip the owner-change
+    bookkeeping writes — the data is identical, so there is nothing new to
+    record. The pc.parcels rebuild itself is always needed (ephemeral).
     """
     if gdb_path is None:
         gdb_path = download_county_gdb(county, config.DATA_DIR / "downloads")
 
+    asset_key = _LAST_ASSET_KEY.get(county, "")
+    prev = conn.execute(
+        "SELECT asset_key FROM parcel_snapshot_meta WHERE county=?", (county,)).fetchone()
+    unchanged = bool(asset_key) and prev is not None and prev["asset_key"] == asset_key
+    skip_bookkeeping = light and unchanged
+    if skip_bookkeeping:
+        LOGGER.info("%s: mirror snapshot unchanged (%s) — light sync, "
+                    "skipping owner-change bookkeeping", county, asset_key)
+
     min_val = float(config.SETTINGS.get("min_market_value", 40000))
     max_val = float(config.SETTINGS.get("max_market_value", 2500000))
     ts = now_iso()
-    stats = {"county": county, "rows": 0, "kept": 0, "absentee": 0, "owner_changes": 0, "new": 0}
+    stats = {"county": county, "rows": 0, "kept": 0, "absentee": 0, "owner_changes": 0,
+             "new": 0, "light_sync": skip_bookkeeping}
 
     # Compact persistent owner identity for absentee parcels (committed DB).
-    known_owners = {
+    known_owners = {} if skip_bookkeeping else {
         row["prop_id"]: row["owner_hash"]
         for row in conn.execute(
             "SELECT prop_id, owner_hash FROM owners_first_seen WHERE county=?", (county,))
@@ -348,7 +379,7 @@ def sync_county(conn, county: str, gdb_path: Path | None = None) -> dict:
         stats["kept"] += 1
         stats["absentee"] += int(absentee)
 
-        if absentee:
+        if absentee and not skip_bookkeeping:
             ohash = owner_hash(p["owner_name"])
             prev_hash = known_owners.get(p["prop_id"])
             if prev_hash is None:
@@ -378,6 +409,11 @@ def sync_county(conn, county: str, gdb_path: Path | None = None) -> dict:
         _insert_parcels(conn, batch)
     if ofs_batch:
         _insert_first_seen(conn, ofs_batch)
+    conn.execute(
+        "INSERT INTO parcel_snapshot_meta (county, asset_key, synced_at, kept, absentee) "
+        "VALUES (?,?,?,?,?) ON CONFLICT (county) DO UPDATE SET asset_key=excluded.asset_key, "
+        "synced_at=excluded.synced_at, kept=excluded.kept, absentee=excluded.absentee",
+        (county, asset_key, ts, stats["kept"], stats["absentee"]))
     conn.commit()
     LOGGER.info("Parcel sync %s: %s", county, stats)
     return stats

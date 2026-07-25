@@ -18,8 +18,10 @@ TAG="parcel-data-2025"   # bump when a new StratMap vintage is adopted (e.g. par
 API="https://api.tnris.org/api/v1"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-# county => TxGIO area_type_name
-declare -A COUNTIES=( [bexar]="Bexar" [comal]="Comal" )
+# county => TxGIO area_type_name (must match `counties` in config/settings.yaml)
+declare -A COUNTIES=( [bexar]="Bexar" [comal]="Comal" [travis]="Travis" )
+# Scaffolded counties — uncomment when enabling them in settings.yaml:
+#   COUNTIES[dallas]="Dallas"  COUNTIES[tarrant]="Tarrant"  COUNTIES[harris]="Harris"
 
 # Find the newest Land Parcels collection
 CID=$(curl -s -A "$UA" "$API/collections?search=land%20parcels" \

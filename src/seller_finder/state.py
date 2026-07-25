@@ -124,6 +124,30 @@ CREATE TABLE IF NOT EXISTS exempt_parcels (
     PRIMARY KEY (county, prop_id)
 ) WITHOUT ROWID;
 
+-- Warm tier: leads scoring warm_tier_min..threshold-1 (absentee-only, etc).
+-- Deliberately COMPACT (no names/addresses — joined from pc.parcels at
+-- runtime) so 100K+ warm rows stay a few MB in the committed DB. NEVER
+-- traced or pushed; auto-promote to `leads` when new signals lift the score.
+CREATE TABLE IF NOT EXISTS warm_leads (
+    county          TEXT NOT NULL,
+    prop_id         TEXT NOT NULL,
+    score           INTEGER DEFAULT 0,
+    signals         TEXT,               -- compact JSON list of signal names
+    updated_at      TEXT,
+    PRIMARY KEY (county, prop_id)
+) WITHOUT ROWID;
+
+-- Parcel snapshot bookkeeping: mirror release asset key per county, so
+-- daily runs can skip the expensive owner-change bookkeeping when the
+-- mirror data hasn't changed (light sync).
+CREATE TABLE IF NOT EXISTS parcel_snapshot_meta (
+    county          TEXT PRIMARY KEY,
+    asset_key       TEXT,               -- "{release_asset_id}:{size}"
+    synced_at       TEXT,
+    kept            INTEGER DEFAULT 0,
+    absentee        INTEGER DEFAULT 0
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_leads_status ON leads (status);
 CREATE INDEX IF NOT EXISTS idx_leads_score ON leads (score);
 """

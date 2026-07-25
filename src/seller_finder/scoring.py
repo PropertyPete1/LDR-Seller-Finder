@@ -8,6 +8,13 @@ Weights (config/settings.yaml → scoring):
   +10 homestead exemption recently removed
 
 Only leads scoring >= skip_trace_threshold (40) move to skip-tracing.
+
+Warm tier (warm_tier_min..threshold-1, e.g. absentee-only at 30): scored
+and stored in the COMPACT warm_leads table (no names/addresses — joined
+from pc.parcels at runtime), NEVER traced or pushed — zero spend. When a
+new signal (deed date, divorce, foreclosure) lifts a warm lead over the
+threshold on a later run, it auto-promotes into the leads table and flows
+to tracing/push like any other qualified lead.
 """
 import datetime as dt
 import json
@@ -23,7 +30,13 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
                    homestead_removed: dict[str, list[str]]) -> dict:
     """Build/refresh the leads table from all signals. Returns stats."""
     stats = {"leads_created": 0, "leads_updated": 0, "qualified": 0,
-             "candidates": 0, "below_threshold": 0}
+             "candidates": 0, "below_threshold": 0,
+             "warm": 0, "warm_promoted": 0}
+    warm_batch: list[tuple] = []
+    warm_existing = {
+        (r["county"], r["prop_id"]) for r in conn.execute(
+            "SELECT county, prop_id FROM warm_leads")
+    }
 
     fc_by_key = {(m["county"] if "county" in m else "bexar", m["prop_id"]): m
                  for m in foreclosure_matches if m.get("prop_id")}
@@ -115,10 +128,6 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
             )
             stats["leads_updated"] += 1
         elif qualified:
-            # Only qualified leads are persisted — sub-threshold candidates
-            # (e.g. absentee-only at 30) are recomputed from the parcel cache
-            # every run, so storing them would only bloat the committed DB
-            # (186K+ rows today, millions at 5+ counties vs GitHub's 100MB cap).
             conn.execute(
                 """INSERT INTO leads (county, prop_id, owner_name, property_addr, mail_addr,
                    score, signals, primary_source, status, created_at, updated_at)
@@ -127,13 +136,43 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
                  json.dumps(signals), primary, "qualified", ts, ts),
             )
             stats["leads_created"] += 1
+            if key in warm_existing:
+                stats["warm_promoted"] += 1  # warm lead crossed the threshold
+        elif score >= config.WARM_TIER_MIN:
+            # Warm tier: compact row only (signal names, no PII bloat) — the
+            # full record is joined from pc.parcels at runtime. NEVER traced
+            # or pushed. ~40 bytes/row keeps 150K+ warm rows a few MB.
+            warm_batch.append(
+                (county, prop_id, score,
+                 json.dumps([s["signal"] for s in signals]), ts))
+            stats["warm"] += 1
+            stats["below_threshold"] += 1
         else:
             stats["below_threshold"] += 1
         stats["qualified"] += int(qualified)
+        if len(warm_batch) >= 5000:
+            _upsert_warm(conn, warm_batch)
+            warm_batch = []
 
+    if warm_batch:
+        _upsert_warm(conn, warm_batch)
+    # Promoted warm leads now live in `leads` — drop their warm rows.
+    conn.execute(
+        "DELETE FROM warm_leads WHERE EXISTS "
+        "(SELECT 1 FROM leads l WHERE l.county=warm_leads.county "
+        " AND l.prop_id=warm_leads.prop_id)")
+    stats["warm_total"] = conn.execute("SELECT COUNT(*) c FROM warm_leads").fetchone()["c"]
     conn.commit()
     LOGGER.info("Scoring: %s", stats)
     return stats
+
+
+def _upsert_warm(conn, batch: list[tuple]) -> None:
+    conn.executemany(
+        "INSERT INTO warm_leads (county, prop_id, score, signals, updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT (county, prop_id) DO UPDATE SET "
+        "score=excluded.score, signals=excluded.signals, updated_at=excluded.updated_at",
+        batch)
 
 
 def _carry_forward_events(existing, signals, score, current_kinds, retention_days):

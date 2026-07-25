@@ -4,7 +4,10 @@ Cost controls:
   * Only leads with score >= threshold are traced.
   * skip_traces table caches results by owner_key (name + mail zip) — an
     owner is NEVER paid for twice, even across counties/properties.
-  * MAX_SKIP_TRACES_PER_RUN caps spend per weekly run.
+  * MAX_SKIP_TRACES_PER_RUN caps spend per run, resolved by RUN_MODE
+    (settings.skip_trace_budget: weekly 75, daily 15 ≈ $50-90/month cap).
+  * Month-to-date trace count + estimated spend are reported in every run's
+    diagnostics and the Monday digest (skip_trace_cost_usd, default $0.15).
 
 Error vs no-match discipline:
   * API ERRORS (provider returns result.error) are never cached and never
@@ -52,7 +55,9 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
     """
     stats = {"eligible": 0, "cached": 0, "traced": 0, "matched": 0,
              "no_match": 0, "errors": 0, "top_error": "",
-             "budget_skipped": 0, "skipped_no_api_key": 0}
+             "budget_skipped": 0, "skipped_no_api_key": 0,
+             "budget": config.MAX_SKIP_TRACES_PER_RUN, "run_mode": config.RUN_MODE,
+             "run_cost_usd": 0.0, "mtd_traces": 0, "mtd_cost_usd": 0.0}
     # Expire stale no-match cache entries FIRST so their leads re-enter the
     # eligibility query below in this same run.
     if config.BATCHDATA_API_KEY:
@@ -69,6 +74,7 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
     ).fetchall()
     stats["eligible"] = len(leads)
     if not leads:
+        _add_spend_stats(conn, stats)
         return stats
 
     if not config.BATCHDATA_API_KEY:
@@ -79,6 +85,7 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
                 (now_iso(), lead["id"]),
             )
         conn.commit()
+        _add_spend_stats(conn, stats)
         stats["skipped_no_api_key"] = len(leads)
         LOGGER.warning(
             "BATCHDATA_API_KEY not set — skip tracing SKIPPED for %d qualified "
@@ -168,8 +175,21 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
                 "run). Top error: %s", stats["errors"], stats["top_error"])
 
     conn.commit()
+    _add_spend_stats(conn, stats)
     LOGGER.info("Skip tracing: %s", stats)
     return stats
+
+
+def _add_spend_stats(conn, stats: dict) -> None:
+    """Attach cost estimates: this run + month-to-date (from skip_traces)."""
+    cost = config.SKIP_TRACE_COST_USD
+    stats["run_cost_usd"] = round(stats["traced"] * cost, 2)
+    month_prefix = _dt.datetime.now(config.CT).strftime("%Y-%m")
+    row = conn.execute(
+        "SELECT COUNT(*) c FROM skip_traces WHERE traced_at LIKE ?",
+        (f"{month_prefix}%",)).fetchone()
+    stats["mtd_traces"] = row["c"]
+    stats["mtd_cost_usd"] = round(row["c"] * cost, 2)
 
 
 def _expire_stale_no_matches(conn) -> int:

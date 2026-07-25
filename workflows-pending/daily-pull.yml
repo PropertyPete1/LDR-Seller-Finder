@@ -1,37 +1,35 @@
-# Weekly Data Pull — runs Monday 6:00 AM CT
+# Daily Data Pull — runs Tue-Sat 6:00 AM CT (fast path: new pre-foreclosure
+# notices + scoring + skip-trace + FUB push). Monday is covered by the full
+# Weekly Data Pull, so the daily cron deliberately skips Monday to avoid a
+# duplicate same-day run.
 # CT = UTC-6 (CST) or UTC-5 (CDT). Using UTC 11:00 for CDT (summer).
 # DST note: GitHub cron uses UTC only. Adjust to 12:00 UTC when CDT ends (~Nov).
-name: Weekly Data Pull
+name: Daily Data Pull
 on:
   schedule:
-    - cron: "0 11 * * 1"
+    - cron: "0 11 * * 2-6"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run (no skip-trace spend, no emails)"
+        description: "Dry run (no skip-trace spend, no FUB push)"
         required: false
         default: "false"
 concurrency:
   group: ldr-seller-state
   cancel-in-progress: false
 env:
-  RUN_MODE: weekly
+  RUN_MODE: daily
   DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   FUB_API_KEY: ${{ secrets.FUB_API_KEY }}
   BATCHDATA_API_KEY: ${{ secrets.BATCHDATA_API_KEY }}
   HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-  SMTP_HOST: ${{ secrets.SMTP_HOST }}
-  SMTP_PORT: ${{ secrets.SMTP_PORT }}
-  SMTP_USER: ${{ secrets.SMTP_USER }}
-  SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-  EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
   LLM_MODEL: claude-sonnet-4-6
   DATABASE_PATH: "data/seller_finder.sqlite3"
 jobs:
-  weekly-pull:
+  daily-pull:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
@@ -51,17 +49,17 @@ jobs:
           mode: pull
           github_token: ${{ secrets.GITHUB_TOKEN }}
           encryption_key: ${{ secrets.SQLITE_ENCRYPTION_KEY }}
-      - name: Run weekly pull
+      - name: Run daily pull
         run: |
-          echo "=== Weekly Pull — DRY_RUN=$DRY_RUN ==="
-          python3 run_weekly_pull.py
+          echo "=== Daily Pull — DRY_RUN=$DRY_RUN ==="
+          python3 run_daily_pull.py
       - name: Upload pending-leads review artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pending-leads
+          name: pending-leads-daily
           path: review/
-          retention-days: 30
+          retention-days: 14
       - name: Write run summary
         if: always()
         run: |

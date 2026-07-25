@@ -1,17 +1,21 @@
-"""Pre-foreclosure / Notice of Trustee Sale — Bexar County Clerk.
+"""Pre-foreclosure / Notice of Trustee Sale — per-county sources.
 
-The Bexar County Clerk publishes the current month's foreclosure-sale notices
-through a public ArcGIS service (the same data behind the county's
-Foreclosure Map at maps.bexar.org/foreclosures). Two layers:
-  layer 0 = Mortgage foreclosures, layer 1 = Tax foreclosures.
+Bexar: the County Clerk publishes the current month's foreclosure-sale
+notices through a public ArcGIS service (the data behind
+maps.bexar.org/foreclosures). Layer 0 = Mortgage, layer 1 = Tax.
+Fields: ADDRESS, DOC_NUMBER, YEAR, MONTH, TYPE, CITY, ZIP. No owner name in
+the feed, so the pipeline matches ADDRESS against parcel situs addresses.
 
-Fields: ADDRESS, DOC_NUMBER, YEAR, MONTH, TYPE, CITY, ZIP. There's no owner
-name in the feed, so the pipeline matches ADDRESS against parcel situs
-addresses to attach the owner.
-
-Comal County posts notices only at the courthouse/physical kiosk — no clean
-digital feed found, so this module is Bexar-only for now (see README).
+Counties WITHOUT a clean feed (Travis — tccsearch.org is CAPTCHA/login
+gated; Comal — courthouse kiosk only) use the CSV INBOX instead: drop
+data/inbox/foreclosures_<county>_*.csv with columns
+  address, zip, doc_number[, city, sale_date]
+and commit — the next run ingests and matches it exactly like a live feed.
+Processed files are renamed *.done so they are never double-ingested.
+See README "County foreclosure sources" for where to export each county's
+notices manually and the paid-API options for full automation.
 """
+import csv
 import logging
 
 import requests
@@ -30,6 +34,9 @@ def fetch(county: str) -> list[dict]:
     if not src:
         LOGGER.info("No foreclosure source configured for %s — skipping", county)
         return []
+    if not src.get("mortgage_url") and not src.get("tax_url"):
+        # No live feed — CSV inbox fallback (Travis et al).
+        return _fetch_from_inbox(county)
 
     notices = []
     for kind, key in (("mortgage", "mortgage_url"), ("tax", "tax_url")):
@@ -63,6 +70,38 @@ def fetch(county: str) -> list[dict]:
                 "zip": str(a.get("ZIP") or "").strip(),
             })
     LOGGER.info("Foreclosure notices for %s: %d", county, len(notices))
+    return notices
+
+
+def _fetch_from_inbox(county: str) -> list[dict]:
+    """Ingest manually-exported notice CSVs from data/inbox/ (see module doc)."""
+    inbox = config.DATA_DIR / "inbox"
+    notices: list[dict] = []
+    if not inbox.exists():
+        LOGGER.info("%s: no live foreclosure feed and no inbox dir — 0 notices", county)
+        return notices
+    for path in sorted(inbox.glob(f"foreclosures_{county}_*.csv")):
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+                    if not row.get("address"):
+                        continue
+                    notices.append({
+                        "address": row["address"],
+                        "doc_number": row.get("doc_number", ""),
+                        "year": None,
+                        "month": None,
+                        "kind": "mortgage",
+                        "city": row.get("city", ""),
+                        "zip": row.get("zip", ""),
+                        "sale_date": row.get("sale_date", ""),
+                    })
+            path.rename(path.with_suffix(".csv.done"))
+            LOGGER.info("%s: ingested foreclosure inbox file %s", county, path.name)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("%s: failed to ingest %s: %s", county, path.name, exc)
+    LOGGER.info("Foreclosure notices for %s (inbox): %d", county, len(notices))
     return notices
 
 

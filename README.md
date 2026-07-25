@@ -1,6 +1,15 @@
 # LDR-Seller-Finder
 
-Seller lead generation system for Lifestyle Design Realty. Every week it pulls public property and court data for the San Antonio metro (Bexar and Comal counties), identifies homeowners who are statistically likely to sell, scores them, skip-traces the qualified ones for contact information, and **auto-pushes contactable leads straight into Follow Up Boss** at the end of the Monday run — tagged, deduped, and annotated. Leads with no email and no phone are held (never pushed), and DNC/litigator-flagged owners carry a `DNC` tag so the nurture system suppresses texting/calling.
+Seller lead generation system for Lifestyle Design Realty. It pulls public property and court data for **Bexar, Comal, and Travis counties**, identifies homeowners who are statistically likely to sell, scores them, skip-traces the qualified ones for contact information, and **auto-pushes contactable leads straight into Follow Up Boss** — tagged, deduped, and annotated. Leads with no email and no phone are held (never pushed), and DNC/litigator-flagged owners carry a `DNC` tag so the nurture system suppresses texting/calling.
+
+Two schedules share one state DB, one healthcheck, and the same diagnostics table:
+
+| Run | Schedule | Scope |
+|---|---|---|
+| **Weekly** (`run_weekly_pull.py`) | Monday 6 AM CT | Full pipeline: mirror parcel refresh + owner-change detection, exemption diffs, divorce/deeds inbox, scoring, tracing (75-trace budget), FUB push, digest email |
+| **Daily** (`run_daily_pull.py`) | Tue–Sat 6 AM CT | Fast path: light parcel sync (skips owner-change bookkeeping when the mirror asset checksum is unchanged), NEW pre-foreclosure notices, scoring, tracing (15-trace budget), FUB push. No digest/exemptions/divorce/deeds |
+
+> The spec said "daily Mon–Sat": Monday is covered by the full weekly run, so the daily cron runs Tue–Sat to avoid a duplicate same-day run (and double spend).
 
 **This repo finds and stages leads. It never contacts them.** All outreach (emails, texts, campaigns) stays in [LDR-Automation-Clean](https://github.com/PropertyPete1/LDR-Automation-Clean), which handles CAN-SPAM compliance, unsubscribe handling, and send-time rules.
 
@@ -9,13 +18,16 @@ Seller lead generation system for Lifestyle Design Realty. Every week it pulls p
 ## How It Works
 
 ```
-                 ┌────────────────────────────────────────────────┐
-                 │        Weekly Data Pull  (Mon 6:00 AM CT)      │
-                 └────────────────────────────────────────────────┘
-  TxGIO parcels (Bexar+Comal) ─┐
-  Bexar exemptions (ArcGIS)  ──┤
-  Bexar pre-foreclosures     ──┼──► Scoring (0–100) ──► score ≥ 40?
-  Divorce filings (stubbed)  ──┘                           │
+         ┌────────────────────────────────────────────────────────────────┐
+         │  Weekly (Mon 6 AM CT, full)  ·  Daily (Tue–Sat 6 AM CT, fast) │
+         └────────────────────────────────────────────────────────────────┘
+  TxGIO parcels (Bexar+Comal+Travis) ─┐
+  Bexar exemptions (ArcGIS, weekly) ──┤
+  Pre-foreclosures (Bexar live,     ──┼──► Scoring (0–100) ─┬─► score ≥ 40?
+     Travis CSV inbox)                │                     │
+  Divorce filings (stubbed)  ────────┘    30–39 = WARM TIER ◀┘ (stored, zero
+                                          spend; auto-promotes on new signals)
+                                                           │ ≥ 40
                                                            ▼
                                               Skip trace (BatchData, cached,
                                               budget-capped, never re-billed)
@@ -32,7 +44,7 @@ Seller lead generation system for Lifestyle Design Realty. Every week it pulls p
                                         │
                                         ▼
                     pending_leads.csv artifact (push record)
-                    + run summary + digest email
+                    + run summary + digest email (weekly only)
 ```
 
 The **Push Approved Leads** workflow still exists as a manual fallback: it retries leads that failed to push and re-checks held leads for newly-found contact info.
@@ -62,9 +74,13 @@ Every run's job summary ends with a **Pipeline diagnostics** table (parcel rows/
 | Owned 10+ years | +20 | ⚠️ Wired — auto-ingests from `data/inbox/` (see below) | Deed date from the free BCAD export (one open-records email), or 10 years of unchanged ownership in our own history |
 | Homestead exemption removed | +10 | ✅ Live (Bexar) | `HS` code present in the previous pull, missing in the current one |
 
-Leads scoring **40 or higher** are skip-traced and auto-pushed (if contactable). Weights and the threshold are tunable in `config/settings.yaml` — no code changes needed.
+Leads scoring **40 or higher** are skip-traced and auto-pushed (if contactable). Weights, thresholds, and budgets are tunable in `config/settings.yaml` — no code changes needed.
 
-Score examples: absentee alone = 30 (not traced). Absentee + pre-foreclosure = 60 (traced). Absentee + divorce = 55 (traced). Absentee + homestead removed = 40 (traced).
+Score examples: absentee alone = 30 (warm tier — stored, never traced). Absentee + pre-foreclosure = 60 (traced). Absentee + divorce = 55 (traced). Absentee + homestead removed = 40 (traced).
+
+### Warm tier (30–39) — zero-spend pipeline
+
+Leads scoring `warm_tier_min` (30) up to threshold−1 — today that's ~180K absentee-only owners — are scored and stored in the compact `warm_leads` table (county, prop_id, score, signal names only; full details are joined from the parcel cache at runtime, keeping 150K+ rows to a few MB). Warm leads are **never skip-traced and never pushed** — zero spend. When a later run adds a signal (deed date import, divorce match, new foreclosure notice), the lead crosses the threshold, **auto-promotes to qualified**, and flows through tracing and push like any other lead. Warm counts (scored this run / total stored / promoted) appear in every run's diagnostics table.
 
 ---
 
@@ -72,9 +88,9 @@ Score examples: absentee alone = 30 (not traced). Absentee + pre-foreclosure = 6
 
 This is the honest state of public data access as of July 2026. Every claim below was verified by actually hitting the endpoints during development.
 
-### 1. Parcel + owner data (Bexar & Comal) — ✅ CLEAN, FREE, BULK
+### 1. Parcel + owner data (Bexar, Comal & Travis) — ✅ CLEAN, FREE, BULK
 
-Neither BCAD (bcad.org) nor Comal AD (comalad.org) offers a self-serve bulk download on their website. Instead we use the **TxGIO StratMap Land Parcels program** (Texas Geographic Information Office / TWDB), which collects every CAD's certified roll, normalizes it, and republishes per-county FileGDB downloads under a **CC0 license**:
+No CAD in our footprint offers a self-serve bulk download on their website. Instead we use the **TxGIO StratMap Land Parcels program** (Texas Geographic Information Office / TWDB), which collects every CAD's certified roll, normalizes it, and republishes per-county FileGDB downloads under a **CC0 license** — this is what makes new counties a 3-line config change:
 
 - API: `https://api.tnris.org/api/v1/collections?search=land+parcels` → newest "Land Parcels" collection → `/resources?collection_id=…&area_type_name=Bexar` returns the zip URL.
 - Verified: Comal file = 103,537 parcels (tax year 2025) with `OWNER_NAME`, `SITUS_*`, `MAIL_*`, `MKT_VALUE`. Bexar ≈ 710K parcels.
@@ -86,7 +102,7 @@ Neither BCAD (bcad.org) nor Comal AD (comalad.org) offers a self-serve bulk down
 
 So the pipeline downloads parcel zips in this order:
 
-1. **PRIMARY — GitHub Release mirror**: the same CC0 zips are attached as assets to this repo's [`parcel-data-2025` release](https://github.com/PropertyPete1/LDR-Seller-Finder/releases/tag/parcel-data-2025) (`bexar_parcels.zip`, `comal_parcels.zip`). github.com is always reachable from Actions runners. Auth uses `GITHUB_TOKEN`/`GH_TOKEN` if set, otherwise the credentials `actions/checkout` persists in `.git/config` — so **no workflow changes were needed**.
+1. **PRIMARY — GitHub Release mirror**: the same CC0 zips are attached as assets to this repo's [`parcel-data-2025` release](https://github.com/PropertyPete1/LDR-Seller-Finder/releases/tag/parcel-data-2025) (`bexar_parcels.zip`, `comal_parcels.zip`, `travis_parcels.zip`). github.com is always reachable from Actions runners. Auth uses `GITHUB_TOKEN`/`GH_TOKEN` if set, otherwise the credentials `actions/checkout` persists in `.git/config` — so **no workflow changes were needed**.
 2. **FALLBACK — TxGIO direct**: the original download path (browser UA + retries), which works from residential/office IPs and covers the case where a mirror asset is missing.
 
 **Quarterly refresh process** (parcel data changes slowly — set a calendar reminder for Jan/Apr/Jul/Oct, or just refresh when TxGIO publishes a new StratMap vintage):
@@ -109,7 +125,7 @@ Bexar County's public parcel layer exposes an `Exempts` field (verified: 405,824
 
 The module compares each pull to the previous one and emits **homestead-removed** events. Comal has no free exemption feed; the module skips counties without an `exemption_sources` entry and logs it.
 
-### 3. Pre-foreclosure notices — ✅ LIVE for Bexar
+### 3. Pre-foreclosure notices — ✅ LIVE for Bexar, CSV inbox for Travis
 
 The Bexar County Clerk publishes the current month's Notice of Trustee Sale filings through the public ArcGIS service that powers the county's [Foreclosure Map](https://maps.bexar.org/foreclosures/):
 
@@ -117,7 +133,26 @@ The Bexar County Clerk publishes the current month's Notice of Trustee Sale fili
 - Tax: `.../MapServer/1`
 - Fields: `ADDRESS, DOC_NUMBER, YEAR, MONTH, TYPE, CITY, ZIP` (verified: 457 notices for the August 2026 sale).
 
-The feed has no owner name, so notices are matched to parcels by normalized address + ZIP to attach the owner. Comal posts notices physically at the courthouse only — no digital feed exists, so pre-foreclosure is Bexar-only for now.
+The feed has no owner name, so notices are matched to parcels by normalized address + ZIP to attach the owner.
+
+Counties **without** a clean feed use the **CSV inbox**: drop `data/inbox/foreclosures_<county>_YYYY-MM.csv` with columns `address, zip, doc_number[, city, sale_date]`, commit, and the next run ingests + matches it exactly like a live feed (files rename to `.done` after processing, so nothing double-ingests).
+
+#### County foreclosure sources — status + what's needed to flip each on
+
+Researched July 2026 (every endpoint below was actually probed):
+
+| County | Parcels/absentee | Foreclosure notices | To activate foreclosures |
+|---|---|---|---|
+| **Bexar** ✅ live | TxGIO | ✅ ArcGIS feed (auto) | — already live |
+| **Comal** ✅ live | TxGIO | ❌ Courthouse posting only, no digital feed | CSV inbox works if you ever transcribe postings; realistically needs a paid API |
+| **Travis** ✅ live | TxGIO (mirror asset uploaded) | ⚠️ CSV inbox. tccsearch.org (Aumentum) is CAPTCHA + login — no automation. travis.tx.publicsearch.us has an FC department but it returns "No documents to search" / query errors (empty/not migrated) | Monthly: export Notice-of-Trustee-Sale list from tccsearch.org manually → drop CSV in inbox. Or a paid API (below) |
+| **Dallas** ⚠️ scaffolded | TxGIO 48113 (config present, `enabled: false`) | dallas.tx.publicsearch.us FC department (notices since 2026-02); client-side JS rendering — fragile to scrape | Add `dallas` to `counties`, upload parcel zip via refresh script; foreclosures via CSV inbox or paid API |
+| **Tarrant** ⚠️ scaffolded | TxGIO 48439 | tarrant.tx.publicsearch.us — same platform/limitations as Dallas | Same as Dallas |
+| **Harris** ⚠️ scaffolded | TxGIO 48201 | cclerk.hctx.net `FRCL_R.aspx` (anonymous OK, ASP.NET WebForms — scrapeable but fragile viewstate pagination) | Same pattern; the ASP.NET search is the least-bad free option if we ever accept scraper risk |
+
+**Paid options that solve foreclosures everywhere at once:** ATTOM (pre-foreclosure API, ~$500+/mo), PropertyRadar, or Foreclosures Daily CSV subscriptions (per-county, cheaper). The CSV inbox means any vendor list drops straight in with zero code changes.
+
+> Note: absentee + warm-tier scoring works in **every** Texas county via TxGIO regardless of foreclosure feed status — a county without foreclosure data still produces absentee leads that auto-promote when deed dates land.
 
 ### 4. Divorce filings — ⚠️ STUBBED (no clean access exists)
 
@@ -154,7 +189,8 @@ Per project policy, we **stub rather than build a fragile scraper**. However, th
 
 ```
 LDR-Seller-Finder/
-├── run_weekly_pull.py            # Weekly cron entry point (data → score → trace → auto-push)
+├── run_weekly_pull.py            # Monday cron entry point (full pipeline)
+├── run_daily_pull.py             # Tue–Sat cron entry point (fast: new foreclosures → trace → push)
 ├── run_push_approved.py          # Manual fallback entry point (retry pushes to FUB)
 ├── config/settings.yaml          # Scoring weights, county sources, budgets — edit freely
 ├── src/seller_finder/
@@ -165,9 +201,9 @@ LDR-Seller-Finder/
 │   ├── review.py                 # Review CSV, run summary, weekly digest email
 │   ├── health.py                 # healthchecks.io dead-man's switch
 │   ├── sources/
-│   │   ├── parcels.py            # TxGIO bulk parcel loader (Bexar, Comal)
+│   │   ├── parcels.py            # TxGIO bulk parcel loader (mirror-first, light sync on daily)
 │   │   ├── exemptions.py         # Bexar homestead exemptions + removal detection
-│   │   ├── preforeclosure.py     # Bexar Notice of Trustee Sale feed
+│   │   ├── preforeclosure.py     # Bexar live feed + CSV inbox (Travis et al)
 │   │   ├── deeds.py              # Deed-date inbox auto-ingest (tenure signal)
 │   │   └── divorce.py            # STUB + CSV inbox + Claude fuzzy matching (live)
 │   └── skiptrace/
@@ -179,9 +215,11 @@ LDR-Seller-Finder/
 │   ├── refresh_parcel_mirror.sh  # Quarterly parcel-mirror refresh (run from home network)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 41 unit tests
+├── tests/test_pipeline.py        # 48 unit tests
+├── workflows-pending/            # New/updated workflow files (see install note below)
 └── .github/
-    ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron
+    ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron (full)
+    ├── workflows/daily-pull.yml      # Tue–Sat 6 AM CT cron (fast) — install from workflows-pending/
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
     └── actions/state-sync/action.yml # Encrypted SQLite ⇄ `state` branch
 ```
@@ -193,7 +231,12 @@ LDR-Seller-Finder/
 | Workflow | Trigger | What it does |
 |---|---|---|
 | **Weekly Data Pull** | Cron `0 11 * * 1` (Mon 6:00 AM CDT) + manual | Full pipeline **including auto-push to FUB**. Uploads `pending-leads` artifact (permanent push record: pushed / held / awaiting-retry), writes the job summary, emails the digest, pings healthchecks.io |
+| **Daily Data Pull** | Cron `0 11 * * 2-6` (Tue–Sat 6:00 AM CDT) + manual | Fast path: light parcel sync from the mirror (owner-change bookkeeping skipped when the mirror asset is unchanged), new pre-foreclosure notices, scoring, tracing (15-trace budget), auto-push. Same state DB, healthcheck, and diagnostics table; no digest email |
 | **Push Approved Leads** | `workflow_dispatch` (manual fallback) | Retries `awaiting_approval` (failed pushes / runs before FUB key existed) and `held_no_contact` leads. Optional `exclude_ids` input skips specific leads. Supports `dry_run` |
+
+Both cron workflows share the `ldr-seller-state` concurrency group, so a long weekly run can never race a daily run on the state DB.
+
+> **Installing/updating workflow files:** the automation token cannot write `.github/workflows/`, so new or changed workflow files land in `workflows-pending/`. To install: open the file in `workflows-pending/` on GitHub → Raw → copy → create the same filename under `.github/workflows/` via **Add file → Create new file** → commit. (Or run `bash scripts/install_workflows.sh` from a local clone.)
 
 > **DST note:** GitHub cron is UTC-only. `0 11` = 6:00 AM CDT (summer). When daylight saving ends in November, change to `0 12` to stay at 6:00 AM CST.
 
@@ -217,7 +260,8 @@ Skip tracing is the only per-unit cost in the system, so it is triple-guarded:
 
 1. **Threshold gate** — only leads scoring ≥ 40 are ever traced (absentee alone doesn't qualify).
 2. **Owner-level cache** — results are stored by normalized owner name + mailing ZIP in `skip_traces`. The same owner is **never billed twice**, across runs, properties, or counties. Within a single run, multi-property owners are traced once and the result attached to all their leads.
-3. **Per-run budget** — `max_skip_traces_per_run: 200` in settings.yaml caps new traces per week (BatchData bills ~$0.07–0.12 per match, so worst case ≈ $14–24/week). Leads that miss the budget stay `qualified` and are picked up next run.
+3. **Per-run budget by mode** — `skip_trace_budget: {weekly: 75, daily: 15}` in settings.yaml. Worst case = 75 + 5×15 = 150 traces/week ≈ **$90/month** at the configured `skip_trace_cost_usd` ($0.15); in practice much lower because the owner cache never re-bills. Leads that miss the budget stay `qualified` and are picked up next run (highest scores first). `MAX_SKIP_TRACES_PER_RUN` env overrides both.
+4. **Spend visibility** — every run's diagnostics table shows *traces this run × cost* and the month-to-date total (counted from the `skip_traces` cache timestamps); the Monday digest includes "Skip-trace spend this month: ~$X".
 
 BatchData filters TCPA-blacklisted numbers by default, and we store the `dnc` and `litigator` flags on every trace — flagged leads are pushed with a `DNC` tag (so nurture suppresses calls/texts) and the flags remain visible in the push-record CSV.
 
@@ -269,12 +313,13 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ---
 
-## Adding a New County (Travis, DFW, Houston…)
+## Adding a New County (Dallas, Tarrant, Harris are pre-scaffolded)
 
-1. Add the county name to `counties` in `config/settings.yaml`.
-2. Add a `parcel_sources` block with its TxGIO `area_type_name` (Travis, Dallas, Tarrant, Harris — FIPS 48453, 48113, 48439, 48201). TxGIO covers all Texas counties, so parcels + absentee detection work everywhere with zero code changes. Also add the county's zip to the `parcel-data-2025` release (add it to `COUNTIES` in `scripts/refresh_parcel_mirror.sh` and run the script) so Actions can download it.
-3. Optional: if the county publishes exemption or foreclosure ArcGIS/REST feeds, add `exemption_sources` / `foreclosure_sources` entries (find them the way we found Bexar's — check the county clerk's GIS/foreclosure map page and inspect its network calls).
-4. Scoring, tracing, staging, and FUB push need no changes.
+1. Add the county name to `counties` in `config/settings.yaml` (for the scaffolded three, the `parcel_sources` block already exists — just remove it from the scaffold comment area / it is picked up automatically once listed in `counties`).
+2. For a brand-new county, add a `parcel_sources` block with its TxGIO `area_type_name` and FIPS. TxGIO covers all Texas counties, so parcels + absentee detection + warm tier work everywhere with zero code changes.
+3. Upload the county's parcel zip to the mirror: uncomment/add the county in `COUNTIES` inside `scripts/refresh_parcel_mirror.sh` and run it **from a home/office network** — it downloads from TxGIO and uploads `{county}_parcels.zip` to the `parcel-data-2025` release.
+4. Foreclosures: add a `foreclosure_sources` entry if the county has a live feed (see the per-county table above), or rely on the CSV inbox.
+5. Scoring, tracing, staging, and FUB push need no changes.
 
 ---
 
@@ -292,7 +337,7 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ```bash
 pip install -r requirements.txt pytest
-python3 -m pytest tests/ -v          # 41 unit tests (scoring, dedupe, matching, migration, error handling)
+python3 -m pytest tests/ -v          # 48 unit tests (scoring, warm tier, budgets, dedupe, matching, migration, error handling)
 DRY_RUN=true python3 scripts/e2e_live_test.py   # live smoke test, zero spend
 ```
 

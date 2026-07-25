@@ -42,6 +42,10 @@ OWNER_EMAIL = _env("OWNER_EMAIL", "peter@lifestyledesignrealty.com")
 # ── Behavior flags ───────────────────────────────────────────────────────
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
+# daily = light run (new pre-foreclosure only); weekly = full pipeline.
+RUN_MODE = (os.environ.get("RUN_MODE") or "weekly").strip().lower()
+if RUN_MODE not in ("daily", "weekly"):
+    RUN_MODE = "weekly"
 
 
 def load_settings() -> dict:
@@ -62,14 +66,25 @@ SCORE_PREFORECLOSURE = SCORING.get("preforeclosure_match", 30)
 SCORE_LONG_OWNERSHIP = SCORING.get("owned_10_plus_years", 20)
 SCORE_HOMESTEAD_REMOVED = SCORING.get("homestead_removed", 10)
 SCORE_THRESHOLD = SCORING.get("skip_trace_threshold", 40)
+# Warm tier: scored and stored (compact), NEVER traced or pushed (zero
+# spend). Auto-promotes to qualified when new signals lift the score.
+WARM_TIER_MIN = SCORING.get("warm_tier_min", 30)
 
 # Counties enabled for this deployment. Add new counties in settings.yaml.
 COUNTIES = SETTINGS.get("counties", ["bexar", "comal"])
 
-# Skip-trace budget guard: max new (never-traced) owners per run.
+# Skip-trace budget guard: max new (never-traced) owners per run, resolved
+# by run mode (settings.skip_trace_budget: {weekly: 75, daily: 15} ≈
+# $50-90/month at $0.15/trace). Env MAX_SKIP_TRACES_PER_RUN overrides both.
+_BUDGETS = SETTINGS.get("skip_trace_budget", {}) or {}
+_DEFAULT_BUDGET = {"weekly": 75, "daily": 15}
 MAX_SKIP_TRACES_PER_RUN = int(
-    os.environ.get("MAX_SKIP_TRACES_PER_RUN", SETTINGS.get("max_skip_traces_per_run", 200))
+    os.environ.get("MAX_SKIP_TRACES_PER_RUN")
+    or _BUDGETS.get(RUN_MODE, _DEFAULT_BUDGET[RUN_MODE])
 )
+
+# Estimated cost per successful skip-trace (for spend reporting only).
+SKIP_TRACE_COST_USD = float(SETTINGS.get("skip_trace_cost_usd", 0.15))
 
 # FUB tags
 TAG_SELLER = "Seller Lead"

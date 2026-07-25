@@ -52,6 +52,12 @@ def test_not_absentee_same_address():
 def test_not_absentee_missing_mail():
     assert not is_absentee("123 MAIN ST", "78201", "", "")
 
+def test_not_absentee_degenerate_situs():
+    """Travis publishes ', TX 78704' situs for most rows — no street number
+    means no comparison, never absentee (prevents county-wide false positives)."""
+    assert not is_absentee(", TX 78704", "78704", "999 ELSEWHERE AVE", "78209")
+    assert not is_absentee(", TX", "", "PO BOX 32368", "78764")
+
 def test_normalize_addr_abbreviations():
     assert normalize_addr("123 North Main Street") == normalize_addr("123 N MAIN ST")
 
@@ -657,3 +663,120 @@ def test_review_csv_written(db, tmp_path, monkeypatch):
     assert out["pending"] == 1
     assert (tmp_path / "review" / "pending_leads.csv").exists()
     assert (tmp_path / "review" / "run_summary.md").exists()
+
+
+# ── Warm tier ────────────────────────────────────────────────────────────
+
+def test_warm_lead_stored_compact(db):
+    """Absentee-only (30) lands in warm_leads, not leads — never traced/pushed."""
+    _insert_parcel(db, prop_id="8001", absentee=1)
+    stats = compute_scores(db, [], [], {})
+    assert stats["warm"] == 1 and stats["qualified"] == 0
+    row = db.execute(
+        "SELECT score, signals FROM warm_leads WHERE prop_id='8001'").fetchone()
+    assert row["score"] == 30
+    assert json.loads(row["signals"]) == ["absentee_owner"]
+    assert db.execute("SELECT COUNT(*) c FROM leads").fetchone()["c"] == 0
+
+
+def test_warm_lead_auto_promotes(db):
+    """A warm lead that gains a foreclosure signal is promoted to qualified
+    and its warm row is removed."""
+    _insert_parcel(db, prop_id="8002", absentee=1)
+    compute_scores(db, [], [], {})
+    assert db.execute("SELECT COUNT(*) c FROM warm_leads").fetchone()["c"] == 1
+    stats = compute_scores(db, [{"county": "bexar", "prop_id": "8002",
+                                 "kind": "mortgage", "doc_number": "d1",
+                                 "month": 8, "year": 2026}], [], {})
+    assert stats["warm_promoted"] == 1 and stats["qualified"] == 1
+    assert db.execute("SELECT COUNT(*) c FROM warm_leads").fetchone()["c"] == 0
+    lead = db.execute("SELECT score, status FROM leads WHERE prop_id='8002'").fetchone()
+    assert lead["score"] == 60 and lead["status"] == "qualified"
+
+
+def test_warm_leads_never_eligible_for_trace(db, monkeypatch):
+    """Warm-tier leads must never enter the skip-trace queue (zero spend)."""
+    from seller_finder.skiptrace import tracer
+    _insert_parcel(db, prop_id="8003", absentee=1)
+    compute_scores(db, [], [], {})
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    stats = tracer.trace_qualified_leads(db)
+    assert stats["eligible"] == 0
+
+
+# ── Budget + spend reporting ─────────────────────────────────────────────
+
+def test_spend_stats_month_to_date(db, monkeypatch):
+    from seller_finder.skiptrace import tracer
+    monkeypatch.setattr(config, "SKIP_TRACE_COST_USD", 0.15)
+    # Seed 3 traces this month
+    for i in range(3):
+        db.execute(
+            "INSERT INTO skip_traces (owner_key, provider, matched, traced_at) "
+            "VALUES (?,?,1,?)", (f"owner{i}|78201", "batchdata", now_iso()))
+    db.commit()
+    stats = {"traced": 2}
+    tracer._add_spend_stats(db, stats)
+    assert stats["run_cost_usd"] == 0.30
+    assert stats["mtd_traces"] == 3
+    assert stats["mtd_cost_usd"] == 0.45
+
+
+def test_budget_caps_traces_per_run(db, monkeypatch):
+    """Only `budget` owners are traced; the rest are budget-deferred."""
+    from seller_finder.skiptrace import tracer
+    for i in range(4):
+        _insert_parcel(db, prop_id=f"90{i}", owner=f"OWNER{i} TEST",
+                       situs=f"{i} ELM ST", mail=f"{i} OAK AVE")
+        compute_scores(db, [{"county": "bexar", "prop_id": f"90{i}",
+                             "kind": "mortgage", "doc_number": f"d{i}",
+                             "month": 8, "year": 2026}], [], {})
+    class FakeProvider:
+        name = "fake"
+        def trace_batch(self, reqs):
+            from seller_finder.skiptrace.base import SkipTraceResult
+            return [SkipTraceResult(matched=True, emails=["a@b.com"], phones=[],
+                                    provider="fake") for _ in reqs]
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": FakeProvider())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    monkeypatch.setattr(config, "MAX_SKIP_TRACES_PER_RUN", 2)
+    stats = tracer.trace_qualified_leads(db)
+    assert stats["traced"] == 2 and stats["budget_skipped"] == 2
+
+
+# ── Foreclosure CSV inbox (Travis et al) ─────────────────────────────────
+
+def test_foreclosure_inbox_ingest(db, tmp_path, monkeypatch):
+    from seller_finder.sources import preforeclosure
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
+                        {"travis": {"inbox": True}})
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "foreclosures_travis_2026-07.csv").write_text(
+        "address,zip,doc_number,city\n"
+        "42 CONGRESS AVE,78701,2026123456,AUSTIN\n"
+        ",78701,skip-no-address,AUSTIN\n")
+    notices = preforeclosure.fetch("travis")
+    assert len(notices) == 1
+    assert notices[0]["address"] == "42 CONGRESS AVE"
+    assert notices[0]["doc_number"] == "2026123456"
+    # File renamed .done — second fetch ingests nothing
+    assert not list(inbox.glob("*.csv"))
+    assert preforeclosure.fetch("travis") == []
+
+
+# ── Light sync (daily runs) ──────────────────────────────────────────────
+
+def test_parcel_snapshot_meta_written(db):
+    """sync_county records the mirror asset key so daily runs can light-sync."""
+    from seller_finder.sources import parcels as pmod
+    pmod._LAST_ASSET_KEY["bexar"] = "123:456"
+    db.execute(
+        "INSERT INTO parcel_snapshot_meta (county, asset_key, synced_at, kept, absentee) "
+        "VALUES ('bexar', '123:456', ?, 10, 5)", (now_iso(),))
+    db.commit()
+    prev = db.execute(
+        "SELECT asset_key FROM parcel_snapshot_meta WHERE county='bexar'").fetchone()
+    assert prev["asset_key"] == pmod._LAST_ASSET_KEY["bexar"]

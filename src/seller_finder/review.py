@@ -161,11 +161,22 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
     lines.append(
         f"| Scoring | all | candidates {sc.get('candidates', 0):,} → qualified "
         f"{sc.get('qualified', 0):,} (below threshold {sc.get('below_threshold', 0):,}) |")
+    lines.append(
+        f"| Warm tier (never traced/pushed) | all | {sc.get('warm', 0):,} scored this "
+        f"run, {sc.get('warm_total', 0):,} total stored, "
+        f"{sc.get('warm_promoted', 0)} promoted to qualified |")
     st = run_stats.get("skiptrace") or {}
     lines.append(
         f"| Skip trace | all | eligible {st.get('eligible', 0)}, cached "
-        f"{st.get('cached', 0)}, traced {st.get('traced', 0)}, no-key-skipped "
+        f"{st.get('cached', 0)}, traced {st.get('traced', 0)} "
+        f"(budget {st.get('budget', '?')}/{st.get('run_mode', 'weekly')} run, "
+        f"budget-deferred {st.get('budget_skipped', 0)}), no-key-skipped "
         f"{st.get('skipped_no_api_key', 0)} |")
+    lines.append(
+        f"| Skip trace spend | all | this run {st.get('traced', 0)} × "
+        f"${config.SKIP_TRACE_COST_USD:.2f} = ${st.get('run_cost_usd', 0):.2f}; "
+        f"month-to-date {st.get('mtd_traces', 0)} traces ≈ "
+        f"${st.get('mtd_cost_usd', 0):.2f} |")
     if st.get("errors"):
         lines.append(
             f"| Skip trace outcomes | all | ✅ matched {st.get('matched', 0)}, "
@@ -189,7 +200,7 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
 
 def render_summary_md(stats: dict, pending: int, run_stats: dict | None = None) -> str:
     lines = [
-        "# LDR-Seller-Finder — Weekly Run Summary",
+        f"# LDR-Seller-Finder — {config.RUN_MODE.title()} Run Summary",
         "",
         f"**Run date:** {dt.datetime.now(config.CT):%Y-%m-%d %H:%M %Z}",
         "",
@@ -231,6 +242,8 @@ def render_summary_md(stats: dict, pending: int, run_stats: dict | None = None) 
 def send_digest_email(conn, run_stats: dict | None = None) -> bool:
     """Weekly digest to Peter: new leads, score breakdown, awaiting approval."""
     stats = _summary_stats(conn)
+    st = (run_stats or {}).get("skiptrace") or {}
+    sc = (run_stats or {}).get("scoring") or {}
     subject = (
         f"LDR Seller Finder — {stats['new_leads_this_week']} new leads, "
         f"{stats['pushed_this_run']} pushed to FUB"
@@ -247,7 +260,10 @@ def send_digest_email(conn, run_stats: dict | None = None) -> bool:
     <b>{stats['pushed_this_run']}</b> leads auto-pushed to Follow Up Boss this run.<br>
     <b>{stats['held_no_contact']}</b> held (skip trace found no email/phone).<br>
     <b>{stats['awaiting_approval']}</b> awaiting retry (push failed / no FUB key).<br>
-    <b>{stats['pushed_total']}</b> leads pushed to Follow Up Boss all-time.</p>
+    <b>{stats['pushed_total']}</b> leads pushed to Follow Up Boss all-time.<br>
+    <b>{sc.get('warm_total', 0):,}</b> warm-tier leads stored (never traced/pushed — zero spend).<br>
+    <b>Skip-trace spend this month: ~${st.get('mtd_cost_usd', 0):.2f}</b>
+    ({st.get('mtd_traces', 0)} traces × ${config.SKIP_TRACE_COST_USD:.2f}).</p>
     <h3>Score breakdown (this run)</h3>
     <table border="1" cellpadding="4"><tr><th>Score band</th><th>Leads</th></tr>{html_rows}</table>
     <h3>By source</h3>
