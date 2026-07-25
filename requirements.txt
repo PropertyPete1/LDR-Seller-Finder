@@ -1,5 +1,10 @@
 requests==2.32.3
 PyYAML==6.0.2
-anthropic>=0.34.0
-pyogrio>=0.10.0
-numpy>=1.26.0
+# Pinned (were open-ended >= ranges). Actions installs fresh on every run, so
+# an unpinned floor let an upstream release change pipeline behaviour between
+# two runs with no commit in this repo.
+# NOTE: the workflows run Python 3.11 — numpy 2.5+ requires >=3.12, so 2.4.x is
+# the correct ceiling here. Bump both together if the runner moves to 3.12.
+anthropic==0.120.0
+pyogrio==0.13.0
+numpy==2.4.6

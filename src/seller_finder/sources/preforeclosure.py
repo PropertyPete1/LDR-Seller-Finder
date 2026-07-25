@@ -11,9 +11,17 @@ gated; Comal — courthouse kiosk only) use the CSV INBOX instead: drop
 data/inbox/foreclosures_<county>_*.csv with columns
   address, zip, doc_number[, city, sale_date]
 and commit — the next run ingests and matches it exactly like a live feed.
-Processed files are renamed *.done so they are never double-ingested.
+Exactly-once ingestion is enforced by the `ingested_files` ledger in the
+committed state DB (keyed by file name + content hash), so a file that stays
+in the repo is never re-processed, and a corrected re-upload of the same name
+IS processed. (An earlier version renamed the file to *.done on the runner —
+that marker was thrown away with the runner, so it never actually worked.)
 See README "County foreclosure sources" for where to export each county's
 notices manually and the paid-API options for full automation.
+
+Failure discipline: a live feed that errors raises FeedUnavailable rather than
+returning an empty list. An empty list means "this county genuinely has no
+notices right now" and must never be produced by a network failure.
 """
 import csv
 import logging
@@ -21,6 +29,7 @@ import logging
 import requests
 
 from .. import config
+from ..state import already_ingested, mark_ingested
 from ..sources.parcels import normalize_addr
 
 LOGGER = logging.getLogger("sources.preforeclosure")
@@ -28,21 +37,38 @@ LOGGER = logging.getLogger("sources.preforeclosure")
 UA = {"User-Agent": "LDR-Seller-Finder/1.0 (public records research)"}
 
 
-def fetch(county: str) -> list[dict]:
-    """Return current-month notices: [{address, doc_number, year, month, kind, city, zip}]."""
+class FeedUnavailable(RuntimeError):
+    """Every configured foreclosure feed for a county failed (network/HTTP).
+
+    Distinct from "no notices": callers must record this as a run error, not
+    as a clean zero, so a blocked feed can never look like a quiet week.
+    """
+
+
+def fetch(county: str, conn=None) -> list[dict]:
+    """Return current-month notices: [{address, doc_number, year, month, kind, city, zip}].
+
+    conn : committed-state connection, required for the CSV-inbox path so
+           ingestion can be recorded in the exactly-once ledger. When omitted,
+           inbox files are read but NOT marked ingested (used by ad-hoc scripts).
+    Raises FeedUnavailable if every configured live feed for the county errored.
+    """
     src = config.SETTINGS.get("foreclosure_sources", {}).get(county)
     if not src:
         LOGGER.info("No foreclosure source configured for %s — skipping", county)
         return []
     if not src.get("mortgage_url") and not src.get("tax_url"):
         # No live feed — CSV inbox fallback (Travis et al).
-        return _fetch_from_inbox(county)
+        return _fetch_from_inbox(county, conn)
 
     notices = []
+    attempted = 0
+    failed = 0
     for kind, key in (("mortgage", "mortgage_url"), ("tax", "tax_url")):
         url = src.get(key)
         if not url:
             continue
+        attempted += 1
         params = {
             "where": "1=1",
             "outFields": "ADDRESS,DOC_NUMBER,YEAR,MONTH,TYPE,CITY,ZIP",
@@ -55,6 +81,7 @@ def fetch(county: str) -> list[dict]:
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Foreclosure fetch failed (%s %s): %s", county, kind, exc)
+            failed += 1
             continue
         for f in data.get("features", []):
             a = f.get("attributes", {})
@@ -69,12 +96,23 @@ def fetch(county: str) -> list[dict]:
                 "city": str(a.get("CITY") or "").strip(),
                 "zip": str(a.get("ZIP") or "").strip(),
             })
+    if attempted and failed == attempted:
+        # Every feed for this county errored. Returning [] here would look
+        # identical to "no foreclosures this month" and silently drop the
+        # signal, so make it a hard error the run records instead.
+        raise FeedUnavailable(
+            f"all {attempted} foreclosure feed(s) for {county} failed "
+            "(see preceding errors) — treating as UNKNOWN, not as zero notices")
     LOGGER.info("Foreclosure notices for %s: %d", county, len(notices))
     return notices
 
 
-def _fetch_from_inbox(county: str) -> list[dict]:
-    """Ingest manually-exported notice CSVs from data/inbox/ (see module doc)."""
+def _fetch_from_inbox(county: str, conn=None) -> list[dict]:
+    """Ingest manually-exported notice CSVs from data/inbox/ (see module doc).
+
+    Files already recorded in the `ingested_files` ledger are skipped, so the
+    CSV can stay committed in the repo without being re-processed every run.
+    """
     inbox = config.DATA_DIR / "inbox"
     notices: list[dict] = []
     if not inbox.exists():
@@ -82,12 +120,16 @@ def _fetch_from_inbox(county: str) -> list[dict]:
         return notices
     for path in sorted(inbox.glob(f"foreclosures_{county}_*.csv")):
         try:
+            if conn is not None and already_ingested(conn, "foreclosure", path):
+                LOGGER.info("%s: inbox file %s already ingested — skipping", county, path.name)
+                continue
+            file_notices: list[dict] = []
             with open(path, newline="", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
                     row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
                     if not row.get("address"):
                         continue
-                    notices.append({
+                    file_notices.append({
                         "address": row["address"],
                         "doc_number": row.get("doc_number", ""),
                         "year": None,
@@ -97,8 +139,11 @@ def _fetch_from_inbox(county: str) -> list[dict]:
                         "zip": row.get("zip", ""),
                         "sale_date": row.get("sale_date", ""),
                     })
-            path.rename(path.with_suffix(".csv.done"))
-            LOGGER.info("%s: ingested foreclosure inbox file %s", county, path.name)
+            notices.extend(file_notices)
+            if conn is not None:
+                mark_ingested(conn, "foreclosure", path, len(file_notices))
+            LOGGER.info("%s: ingested foreclosure inbox file %s (%d notices)",
+                        county, path.name, len(file_notices))
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("%s: failed to ingest %s: %s", county, path.name, exc)
     LOGGER.info("Foreclosure notices for %s (inbox): %d", county, len(notices))

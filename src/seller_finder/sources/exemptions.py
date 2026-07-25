@@ -106,10 +106,22 @@ def sync_county(conn, county: str) -> dict:
         if _has_homestead(exempts):
             seen_hs.add(prop_id)
 
-    if not current and prev:
-        # Defensive: an empty feed would mark every parcel homestead-removed.
-        LOGGER.warning("Exemption feed for %s returned 0 rows — keeping previous "
-                       "snapshot, skipping homestead-removed detection", county)
+    # Defensive: homestead_removed is computed as "in the previous snapshot but
+    # not in this one", so a SHORT pull is as dangerous as an empty one — an
+    # ArcGIS page that stops early (server-side maxRecordCount, a truncated
+    # response) would mark thousands of parcels homestead-removed. +10 is
+    # enough to lift an absentee lead from 30 to the 40 trace threshold, so a
+    # truncated pull turns straight into skip-trace spend and FUB pushes.
+    # Require the new snapshot to be within a sane fraction of the old one
+    # before trusting a removal diff.
+    min_ratio = float(config.SETTINGS.get("exemption_min_snapshot_ratio", 0.5))
+    if prev and len(current) < len(prev) * min_ratio:
+        LOGGER.warning(
+            "Exemption feed for %s returned %d rows vs %d previously (< %.0f%% "
+            "of the previous snapshot) — looks truncated. Keeping previous "
+            "snapshot, skipping homestead-removed detection.",
+            county, len(current), len(prev), min_ratio * 100)
+        stats["truncated_feed"] = True
         return stats
 
     # Homestead removed = previously had HS, current pull says otherwise.

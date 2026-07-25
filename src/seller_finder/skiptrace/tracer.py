@@ -5,7 +5,9 @@ Cost controls:
   * skip_traces table caches results by owner_key (name + mail zip) — an
     owner is NEVER paid for twice, even across counties/properties.
   * MAX_SKIP_TRACES_PER_RUN caps spend per run, resolved by RUN_MODE
-    (settings.skip_trace_budget: weekly 75, daily 15 ≈ $50-90/month cap).
+    (settings.skip_trace_budget: weekly 75, daily 15). Scheduled worst case is
+    5 weekly + 22 daily runs = 705 traces ≈ $105.75/month at $0.15. This is a
+    PER-RUN cap: mtd_traces below is reporting only, not a monthly ceiling.
   * Month-to-date trace count + estimated spend are reported in every run's
     diagnostics and the Monday digest (skip_trace_cost_usd, default $0.15).
 

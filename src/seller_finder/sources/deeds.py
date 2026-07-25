@@ -16,8 +16,10 @@ How this module works — fully automatic once the file exists:
      county may be omitted -> defaults to 'bexar'.
      deed_date accepts  YYYY-MM-DD, MM/DD/YYYY, YYYYMMDD, or bare YYYY.
   2. Every weekly run ingests inbox files into the encrypted state DB
-     (deed_dates table) BEFORE scoring, then renames the file to *.imported
-     so it is never double-processed.
+     (deed_dates table) BEFORE scoring. Exactly-once processing is enforced by
+     the `ingested_files` ledger in the committed state DB (file name + content
+     hash) — NOT by renaming the file, because the runner never commits its
+     working tree back to `main`, so a rename there is thrown away.
   3. scoring._owned_ten_plus_years() reads deed_dates first, and falls back
      to the owner_history proxy (unchanged owner across runs).
 
@@ -30,7 +32,7 @@ import re
 from pathlib import Path
 
 from .. import config
-from ..state import now_iso
+from ..state import already_ingested, mark_ingested, now_iso
 
 LOGGER = logging.getLogger("sources.deeds")
 
@@ -90,8 +92,8 @@ def ingest_file(conn, path: Path, default_county: str = "bexar") -> int:
 
 
 def ingest_inbox(conn) -> dict:
-    """Ingest all deed CSVs waiting in data/inbox/. Files are renamed to
-    *.imported afterward so they are processed exactly once."""
+    """Ingest all deed CSVs waiting in data/inbox/, exactly once per file
+    content (see the `ingested_files` ledger in state.py)."""
     inbox = config.DATA_DIR / "inbox"
     stats = {"files": 0, "rows": 0}
     if not inbox.exists():
@@ -103,13 +105,16 @@ def ingest_inbox(conn) -> dict:
                 continue
             seen.add(path)
             try:
+                if already_ingested(conn, "deeds", path):
+                    LOGGER.info("Deed inbox file %s already imported — skipping", path.name)
+                    continue
                 rows = ingest_file(conn, path)
+                mark_ingested(conn, "deeds", path, rows)
             except Exception as exc:  # noqa: BLE001 — a bad file must not kill the run
                 LOGGER.error("Deed import failed for %s: %s", path.name, exc)
                 continue
             stats["files"] += 1
             stats["rows"] += rows
-            path.rename(path.with_suffix(path.suffix + ".imported"))
             LOGGER.info("Imported %d deed dates from %s", rows, path.name)
     total = conn.execute("SELECT COUNT(*) AS c FROM deed_dates").fetchone()["c"]
     stats["total_deed_dates"] = total

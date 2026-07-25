@@ -26,9 +26,12 @@ scoring:
   warm_tier_min: 30           # 30..threshold-1 = "warm": stored, never traced/pushed
 
 # Skip-trace budget per run, by run mode. Weekly (Monday) + daily (Tue-Sat)
-# at these defaults ≈ 75 + 5×15 = 150 traces/week max ≈ $90/month worst case
-# at $0.15/trace — in practice much lower because the cache never re-bills
-# an owner. Env var MAX_SKIP_TRACES_PER_RUN overrides both.
+# at these defaults = 75 + 5×15 = 150 traces/week max. Worst case in a single
+# calendar month is 5 weekly + 22 daily runs = 705 traces ≈ $105.75 at
+# $0.15/trace — in practice much lower because the cache never re-bills an
+# owner. NOTE: this is a PER-RUN cap only; there is no month-to-date ceiling,
+# and each manual workflow_dispatch grants a fresh budget.
+# Env var MAX_SKIP_TRACES_PER_RUN overrides both.
 skip_trace_budget:
   weekly: 75
   daily: 15
@@ -41,6 +44,18 @@ skip_trace_cost_usd: 0.15
 # for). NO-MATCH results expire after this many days so the owner can be
 # re-traced later as provider data improves. API errors are never cached.
 no_match_retrace_days: 90
+
+# Event signals (preforeclosure, divorce_filing) come from feeds that only
+# cover a current window. When a run doesn't re-observe the event, the stored
+# signal is carried forward for this many days from the date it was ACTUALLY
+# observed (signal.observed_at) so a qualified lead isn't demoted between
+# runs — then it expires. Was previously an undocumented code default.
+event_signal_retention_days: 120
+
+# Homestead-removed detection is a diff against the previous exemption
+# snapshot, so a truncated feed reads as mass removals. Skip the diff when a
+# pull returns less than this fraction of the previous snapshot.
+exemption_min_snapshot_ratio: 0.5
 
 # TxGIO StratMap land-parcel bulk downloads (CC0, statewide program).
 # The loader queries the TxGIO API for the newest "Land Parcels" collection

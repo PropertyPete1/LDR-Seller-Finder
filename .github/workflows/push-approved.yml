@@ -45,9 +45,15 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           encryption_key: ${{ secrets.SQLITE_ENCRYPTION_KEY }}
       - name: Push approved leads to FUB
+        # exclude_ids is passed through env, NOT interpolated into the script.
+        # `${{ }}` inside a run: block is substituted before bash sees it, so a
+        # crafted dispatch input would execute as shell in a job that holds
+        # every API secret.
+        env:
+          EXCLUDE_IDS: ${{ github.event.inputs.exclude_ids }}
         run: |
           echo "=== Push Approved — DRY_RUN=$DRY_RUN ==="
-          python3 run_push_approved.py --exclude-ids "${{ github.event.inputs.exclude_ids }}"
+          python3 run_push_approved.py --exclude-ids "$EXCLUDE_IDS"
       - name: Push state DB
         if: always()
         uses: ./.github/actions/state-sync

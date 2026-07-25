@@ -33,7 +33,7 @@ from seller_finder.scoring import compute_scores  # noqa: E402
 from seller_finder.skiptrace.tracer import trace_qualified_leads  # noqa: E402
 from seller_finder.review import stage_traced_leads, write_review_files  # noqa: E402
 from seller_finder.fub import auto_push_leads  # noqa: E402
-from seller_finder.health import ping_healthcheck  # noqa: E402
+from seller_finder.health import collect_stage_errors, ping_healthcheck  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("daily_pull")
@@ -60,7 +60,7 @@ def main() -> int:
     foreclosure_matches = []
     for county in config.COUNTIES:
         try:
-            notices = preforeclosure.fetch(county)
+            notices = preforeclosure.fetch(county, conn=conn)
             matched = preforeclosure.match_to_parcels(conn, county, notices)
             for m in matched:
                 m["county"] = county
@@ -70,6 +70,7 @@ def main() -> int:
             }
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Pre-foreclosure failed for %s: %s", county, exc)
+            stats["counties"].setdefault(county, {})["preforeclosure"] = {"error": str(exc)}
 
     # 3. Score (divorce/homestead signals carry forward from stored leads)
     stats["scoring"] = compute_scores(conn, foreclosure_matches, [], {})
@@ -87,12 +88,22 @@ def main() -> int:
 
     # 6. Artifacts + heartbeat (no digest email on daily runs)
     stats["review"] = write_review_files(conn, run_stats=stats)
+    # Every stage above is wrapped in try/except so one bad county can't kill
+    # the run — which also means the process would exit 0 and ping the
+    # dead-man's switch green after a total failure. Convert the swallowed
+    # errors into a run-level verdict.
+    failures = collect_stage_errors(stats)
+    stats["stage_failures"] = failures
     record_run(conn, "daily_pull", started, stats)
     conn.commit()
     conn.close()
     stats["state_db_mb"] = round(check_state_size(), 1)
-    ping_healthcheck()
+    ping_healthcheck(failed=bool(failures))
     LOGGER.info("=== Daily pull complete: %s ===", {k: v for k, v in stats.items() if k != "counties"})
+    if failures:
+        LOGGER.error("Daily pull finished with %d failed stage(s): %s",
+                     len(failures), ", ".join(failures))
+        return 1
     return 0
 
 

@@ -30,7 +30,7 @@ from seller_finder.scoring import compute_scores  # noqa: E402
 from seller_finder.skiptrace.tracer import trace_qualified_leads  # noqa: E402
 from seller_finder.review import stage_traced_leads, write_review_files, send_digest_email  # noqa: E402
 from seller_finder.fub import auto_push_leads  # noqa: E402
-from seller_finder.health import ping_healthcheck  # noqa: E402
+from seller_finder.health import collect_stage_errors, ping_healthcheck  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("weekly_pull")
@@ -60,12 +60,13 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Exemption sync failed for %s: %s", county, exc)
             homestead_removed[county] = []
+            stats["counties"][county]["exemptions"] = {"error": str(exc)}
 
     # 3. Pre-foreclosure
     foreclosure_matches = []
     for county in config.COUNTIES:
         try:
-            notices = preforeclosure.fetch(county)
+            notices = preforeclosure.fetch(county, conn=conn)
             matched = preforeclosure.match_to_parcels(conn, county, notices)
             for m in matched:
                 m["county"] = county
@@ -75,6 +76,7 @@ def main() -> int:
             }
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Pre-foreclosure failed for %s: %s", county, exc)
+            stats["counties"].setdefault(county, {})["preforeclosure"] = {"error": str(exc)}
 
     # 4. Divorce (stubbed feed; matching fully live)
     divorce_matches = []
@@ -86,12 +88,14 @@ def main() -> int:
         stats["divorce"] = {"filings": len(filings), "matched": len(divorce_matches)}
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Divorce module failed: %s", exc)
+        stats["divorce"] = {"error": str(exc)}
 
     # 5. Deed dates (BCAD export inbox → tenure signal), then scoring
     try:
         stats["deeds"] = deeds.ingest_inbox(conn)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Deed ingest failed: %s", exc)
+        stats["deeds"] = {"error": str(exc)}
     stats["scoring"] = compute_scores(conn, foreclosure_matches, divorce_matches, homestead_removed)
 
     # 6. Skip trace (cost-guarded)
@@ -110,12 +114,20 @@ def main() -> int:
 
     # 9. Digest + heartbeat + committed-DB size guard
     stats["digest_sent"] = send_digest_email(conn, run_stats=stats)
+    # See run_daily_pull: per-stage try/except would otherwise let a totally
+    # failed run exit 0 and ping the dead-man's switch green.
+    failures = collect_stage_errors(stats)
+    stats["stage_failures"] = failures
     record_run(conn, "weekly_pull", started, stats)
     conn.commit()
     conn.close()
     stats["state_db_mb"] = round(check_state_size(), 1)
-    ping_healthcheck()
+    ping_healthcheck(failed=bool(failures))
     LOGGER.info("=== Weekly pull complete: %s ===", {k: v for k, v in stats.items() if k != "counties"})
+    if failures:
+        LOGGER.error("Weekly pull finished with %d failed stage(s): %s",
+                     len(failures), ", ".join(failures))
+        return 1
     return 0
 
 

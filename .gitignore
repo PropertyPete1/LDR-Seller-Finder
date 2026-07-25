@@ -2,7 +2,11 @@
 data/*.sqlite3
 data/*.sqlite3-journal
 data/downloads/
-data/inbox/*.csv
+# NOTE: data/inbox/*.csv is deliberately NOT ignored. Committing those CSVs is
+# the ONLY way manual county exports (Travis foreclosure notices, BCAD deed
+# dates) reach the Actions runner — the runner checks out `main` and has no
+# other channel. Exactly-once ingestion is enforced by the `ingested_files`
+# ledger in the committed state DB, not by renaming files on disk.
 review/
 
 __pycache__/

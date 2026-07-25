@@ -331,8 +331,32 @@ def test_migration_v2_purges_poisoned_no_matches(tmp_path):
     assert conn2.execute("SELECT COUNT(*) c FROM skip_traces WHERE matched=0").fetchone()["c"] == 0
     lead = conn2.execute("SELECT status, skip_trace_id FROM leads WHERE prop_id='9001'").fetchone()
     assert lead["status"] == "qualified" and lead["skip_trace_id"] is None
-    assert conn2.execute("PRAGMA user_version").fetchone()[0] == 2
+    # v2 ran; the DB is carried forward to the current schema version (>=3
+    # adds the inbox ingest ledger).
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] >= 2
     conn2.close()
+
+
+def test_migrations_are_versioned_and_rerunnable(tmp_path):
+    """Reopening the same DB must be a no-op: user_version stops re-running the
+    one-time migrations, and a legitimately cached matched trace survives."""
+    db_file = tmp_path / "m.sqlite3"
+    conn = get_db(db_file, parcels_cache=tmp_path / "c1.sqlite3")
+    version_after_first = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.execute(
+        "INSERT INTO skip_traces (owner_key, provider, matched, emails, phones, "
+        "dnc, litigator, raw, traced_at) VALUES ('PAID|78201','batchdata',1,'[]','[]',0,0,'null',?)",
+        (now_iso(),))
+    conn.commit()
+    conn.close()
+
+    for _ in range(3):  # re-runnable: opening again changes nothing
+        c = get_db(db_file, parcels_cache=tmp_path / "c2.sqlite3")
+        assert c.execute("PRAGMA user_version").fetchone()[0] == version_after_first
+        # matched (already paid for) traces are never purged by any migration
+        assert c.execute(
+            "SELECT COUNT(*) c FROM skip_traces WHERE matched=1").fetchone()["c"] == 1
+        c.close()
 
 
 def test_diagnostics_show_trace_outcomes():
@@ -400,10 +424,19 @@ def test_deed_inbox_ingest_and_tenure_scoring(db, tmp_path, monkeypatch):
     )
     stats = deeds.ingest_inbox(db)
     assert stats["files"] == 1 and stats["rows"] == 1
-    assert (inbox / "deeds_bexar.csv.imported").exists()
+    # The CSV STAYS in the repo (it is committed — that is how it reaches the
+    # Actions runner). Exactly-once comes from the ingest ledger, not a rename.
+    assert (inbox / "deeds_bexar.csv").exists()
+    assert db.execute(
+        "SELECT COUNT(*) c FROM ingested_files WHERE kind='deeds'").fetchone()["c"] == 1
     # Re-running must not re-import
     stats2 = deeds.ingest_inbox(db)
     assert stats2["files"] == 0
+    # A corrected re-upload under the same name IS re-ingested (content differs)
+    (inbox / "deeds_bexar.csv").write_text(
+        "county,prop_id,deed_date\nbexar,6001,2009-03-15\nbexar,6002,2010-01-01\n")
+    stats3 = deeds.ingest_inbox(db)
+    assert stats3["files"] == 1 and stats3["rows"] == 2
 
     # Tenure signal: absentee (30) + owned 10+ years (20) = 50 → qualified
     _insert_parcel(db, prop_id="6001", absentee=1)
@@ -758,13 +791,76 @@ def test_foreclosure_inbox_ingest(db, tmp_path, monkeypatch):
         "address,zip,doc_number,city\n"
         "42 CONGRESS AVE,78701,2026123456,AUSTIN\n"
         ",78701,skip-no-address,AUSTIN\n")
-    notices = preforeclosure.fetch("travis")
+    notices = preforeclosure.fetch("travis", conn=db)
     assert len(notices) == 1
     assert notices[0]["address"] == "42 CONGRESS AVE"
     assert notices[0]["doc_number"] == "2026123456"
-    # File renamed .done — second fetch ingests nothing
-    assert not list(inbox.glob("*.csv"))
-    assert preforeclosure.fetch("travis") == []
+    # The CSV stays committed in the repo; the ledger (not a rename) is what
+    # makes ingestion exactly-once, because the runner never commits back to main.
+    assert (inbox / "foreclosures_travis_2026-07.csv").exists()
+    assert preforeclosure.fetch("travis", conn=db) == []
+
+
+def test_foreclosure_inbox_csvs_are_not_gitignored():
+    """Regression: data/inbox/*.csv was gitignored, so Travis (inbox-only, no
+    live feed) could never receive a single foreclosure notice on Actions."""
+    import subprocess
+    from pathlib import Path as _P
+    repo = _P(__file__).resolve().parents[1]
+    out = subprocess.run(
+        ["git", "check-ignore", "-v", "data/inbox/foreclosures_travis_2026-07.csv"],
+        cwd=repo, capture_output=True, text=True)
+    # exit 1 == "not ignored"
+    assert out.returncode == 1, (
+        "data/inbox/*.csv is gitignored — committed county exports will never "
+        f"reach the Actions runner. Matched rule: {out.stdout.strip()}")
+
+
+def test_live_feed_failure_is_an_error_not_zero_notices(monkeypatch):
+    """A blocked foreclosure feed must raise, never look like a quiet month."""
+    from seller_finder.sources import preforeclosure
+
+    monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
+                        {"bexar": {"mortgage_url": "https://example.invalid/m",
+                                   "tax_url": "https://example.invalid/t"}})
+
+    def boom(*a, **k):
+        raise OSError("connection reset")
+    monkeypatch.setattr(preforeclosure.requests, "get", boom)
+
+    with pytest.raises(preforeclosure.FeedUnavailable):
+        preforeclosure.fetch("bexar")
+
+
+def test_partial_feed_failure_still_returns_the_good_half(monkeypatch):
+    """One of two feeds failing is degraded, not fatal — keep what we got."""
+    from seller_finder.sources import preforeclosure
+
+    monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
+                        {"bexar": {"mortgage_url": "https://example.invalid/m",
+                                   "tax_url": "https://example.invalid/t"}})
+
+    class OkResp:
+        status_code = 200
+        @staticmethod
+        def raise_for_status():
+            return None
+        @staticmethod
+        def json():
+            return {"features": [{"attributes": {
+                "ADDRESS": "1 MAIN ST", "DOC_NUMBER": "D1", "YEAR": 2026,
+                "MONTH": 8, "CITY": "SAN ANTONIO", "ZIP": "78201"}}]}
+
+    calls = {"n": 0}
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("mortgage feed down")
+        return OkResp()
+    monkeypatch.setattr(preforeclosure.requests, "get", flaky)
+
+    notices = preforeclosure.fetch("bexar")
+    assert len(notices) == 1 and notices[0]["kind"] == "tax"
 
 
 # ── Light sync (daily runs) ──────────────────────────────────────────────
@@ -780,3 +876,287 @@ def test_parcel_snapshot_meta_written(db):
     prev = db.execute(
         "SELECT asset_key FROM parcel_snapshot_meta WHERE county='bexar'").fetchone()
     assert prev["asset_key"] == pmod._LAST_ASSET_KEY["bexar"]
+
+
+# ── Audit regressions (2026-07) ──────────────────────────────────────────
+# Each test below pins a defect found in the pre-scale audit. See FINDINGS.md.
+
+def test_batchdata_200_with_error_body_is_an_error_not_no_matches(monkeypatch):
+    """The 403→64-no-matches bug, one layer down: BatchData can return HTTP 200
+    with the real status in the body. That must NOT be cached as no-match."""
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R200Err:
+        status_code = 200
+        text = '{"status":{"code":401,"text":"Unauthorized"}}'
+        @staticmethod
+        def json():
+            return {"status": {"code": 401, "text": "Unauthorized"},
+                    "results": {"persons": []}}
+
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: R200Err())
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([SkipTraceRequest(street=f"{i} A ST", city="SA", state="TX",
+                                          zip="78201") for i in range(3)])
+    assert len(out) == 3
+    assert all(r.error and "401" in r.error for r in out)
+    assert all(r.matched is False for r in out)
+
+
+def test_batchdata_200_all_records_errored_is_an_error(monkeypatch):
+    """meta errorCount covering the whole chunk means nothing was looked up."""
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R200:
+        status_code = 200
+        text = "{}"
+        @staticmethod
+        def json():
+            return {"results": {"persons": [], "meta": {"results": {
+                "requestCount": 2, "matchCount": 0, "noMatchCount": 0,
+                "errorCount": 2}}}}
+
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: R200())
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([SkipTraceRequest(street=f"{i} A ST", city="SA", state="TX",
+                                          zip="78201") for i in range(2)])
+    assert all(r.error and "errorCount=2" in r.error for r in out)
+
+
+def test_batchdata_genuine_no_match_is_still_cacheable(monkeypatch):
+    """Guard against over-correction: a real all-no-match run must stay clean."""
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R200:
+        status_code = 200
+        text = "{}"
+        @staticmethod
+        def json():
+            return {"status": {"code": 200}, "results": {"persons": [], "meta": {
+                "results": {"requestCount": 1, "matchCount": 0,
+                            "noMatchCount": 1, "errorCount": 0}}}}
+
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: R200())
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([SkipTraceRequest(street="1 A ST", city="SA", state="TX", zip="78201")])
+    assert out[0].error is None and out[0].matched is False
+
+
+def test_fub_search_failure_never_creates_a_duplicate(db, monkeypatch):
+    """A FUB outage during dedupe must abort the push, not create a new person."""
+    from seller_finder import fub
+
+    lead_id = _make_awaiting_lead(db, "7101", emails='["dup@x.com"]')
+    lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "generate_summary_note", lambda lead: "")
+
+    created = {"n": 0}
+
+    class DeadSession:
+        auth = None
+        headers = {}
+        def update(self, *a, **k):
+            return None
+        def get(self, *a, **k):
+            raise OSError("FUB unreachable")
+        def post(self, *a, **k):
+            created["n"] += 1
+            raise AssertionError("must not create a person when dedupe failed")
+    monkeypatch.setattr(fub.requests, "Session", lambda: DeadSession())
+
+    assert fub.push_lead(db, lead) is None
+    assert created["n"] == 0
+
+
+def test_fub_push_failure_leaves_lead_for_retry(db, monkeypatch):
+    """Failed pushes stay awaiting_approval so the next run retries them."""
+    from seller_finder import fub
+    _make_awaiting_lead(db, "7102", emails='["a@b.com"]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "push_lead", lambda conn, lead: None)
+    stats = fub.auto_push_leads(db)
+    assert stats["failed"] == 1 and stats["pushed"] == 0
+    row = db.execute("SELECT status, fub_person_id FROM leads WHERE prop_id='7102'").fetchone()
+    assert row["status"] == "awaiting_approval" and row["fub_person_id"] is None
+
+
+def test_event_signal_expires_after_retention_window(db, monkeypatch):
+    """A one-off foreclosure notice must NOT keep its +30 forever.
+
+    Regression: retention was measured from leads.updated_at, which
+    compute_scores rewrites every run, so age was always ~0 and the signal
+    never expired.
+    """
+    monkeypatch.setitem(config.SETTINGS, "event_signal_retention_days", 120)
+    _insert_parcel(db, prop_id="2101", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "2101", "kind": "mortgage",
+                         "doc_number": "d1", "month": 8, "year": 2026}], [], {})
+    assert db.execute(
+        "SELECT score FROM leads WHERE prop_id='2101'").fetchone()["score"] == 60
+
+    # Age the stored signal past the retention window (simulating ~1 year of
+    # weekly runs), leaving updated_at fresh exactly as real runs do.
+    row = db.execute("SELECT signals FROM leads WHERE prop_id='2101'").fetchone()
+    signals = json.loads(row["signals"])
+    for s in signals:
+        if s["signal"] == "preforeclosure":
+            s["observed_at"] = "2025-01-01"
+    db.execute("UPDATE leads SET signals=?, updated_at=? WHERE prop_id='2101'",
+               (json.dumps(signals), now_iso()))
+    db.commit()
+
+    compute_scores(db, [], [], {})
+    lead = db.execute("SELECT score, signals, status FROM leads WHERE prop_id='2101'").fetchone()
+    assert lead["score"] == config.SCORE_ABSENTEE  # foreclosure points dropped
+    assert "preforeclosure" not in {s["signal"] for s in json.loads(lead["signals"])}
+
+
+def test_event_signal_survives_inside_retention_window(db, monkeypatch):
+    """The carry-forward itself must keep working — no demotion between runs."""
+    monkeypatch.setitem(config.SETTINGS, "event_signal_retention_days", 120)
+    _insert_parcel(db, prop_id="2102", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "2102", "kind": "mortgage",
+                         "doc_number": "d2", "month": 8, "year": 2026}], [], {})
+    for _ in range(3):  # three more runs with no notice in the feed
+        compute_scores(db, [], [], {})
+    lead = db.execute("SELECT score, status FROM leads WHERE prop_id='2102'").fetchone()
+    assert lead["score"] == 60 and lead["status"] == "qualified"
+
+
+def test_truncated_exemption_feed_does_not_mass_flag_homestead_removed(db, monkeypatch):
+    """A short ArcGIS page must not report thousands of homestead removals —
+    absentee(30) + homestead_removed(10) == the 40 trace threshold, so this
+    would convert straight into skip-trace spend and FUB pushes."""
+    from seller_finder.sources import exemptions
+
+    monkeypatch.setitem(config.SETTINGS, "exemption_sources",
+                        {"bexar": {"url": "https://example.invalid/q"}})
+    ts = now_iso()
+    db.executemany(
+        "INSERT INTO exempt_parcels (county, prop_id, exempts, last_seen_at) VALUES (?,?,?,?)",
+        [("bexar", str(i), "HS", ts) for i in range(100)])
+    db.commit()
+
+    # Feed returns only 10 of the 100 known rows (truncated page)
+    monkeypatch.setattr(exemptions, "fetch_exemptions",
+                        lambda county: iter([(str(i), "HS") for i in range(10)]))
+    stats = exemptions.sync_county(db, "bexar")
+    assert stats["homestead_removed"] == []
+    assert stats.get("truncated_feed") is True
+    # Previous snapshot preserved, not overwritten with the partial pull
+    assert db.execute(
+        "SELECT COUNT(*) c FROM exempt_parcels WHERE county='bexar'").fetchone()["c"] == 100
+
+
+def test_real_homestead_removal_still_detected(db, monkeypatch):
+    """Guard against over-correction: a full pull must still diff normally."""
+    from seller_finder.sources import exemptions
+
+    monkeypatch.setitem(config.SETTINGS, "exemption_sources",
+                        {"bexar": {"url": "https://example.invalid/q"}})
+    ts = now_iso()
+    db.executemany(
+        "INSERT INTO exempt_parcels (county, prop_id, exempts, last_seen_at) VALUES (?,?,?,?)",
+        [("bexar", str(i), "HS", ts) for i in range(10)])
+    db.commit()
+    # 9 of 10 still have HS; parcel "0" lost it
+    monkeypatch.setattr(exemptions, "fetch_exemptions",
+                        lambda county: iter([(str(i), "HS") for i in range(1, 10)]))
+    stats = exemptions.sync_county(db, "bexar")
+    assert stats["homestead_removed"] == ["0"]
+
+
+def test_healthcheck_pings_fail_endpoint_on_failure(monkeypatch):
+    from seller_finder import health
+    seen = {}
+    monkeypatch.setattr(config, "HEALTHCHECK_URL", "https://hc.example/abc")
+    monkeypatch.setattr(config, "DRY_RUN", False)
+
+    class Resp:
+        status_code = 200
+    monkeypatch.setattr(health.requests, "get",
+                        lambda url, **k: (seen.update(url=url), Resp())[1])
+
+    health.ping_healthcheck(failed=False)
+    assert seen["url"] == "https://hc.example/abc"
+    health.ping_healthcheck(failed=True)
+    assert seen["url"] == "https://hc.example/abc/fail"
+
+
+def test_collect_stage_errors_finds_swallowed_failures():
+    from seller_finder.health import collect_stage_errors
+    assert collect_stage_errors({}) == []
+    assert collect_stage_errors({
+        "counties": {"bexar": {"parcels": {"rows": 10}},
+                     "travis": {"parcels": {"error": "403 blocked"},
+                                "preforeclosure": {"error": "feed down"}}},
+        "fub_push": {"error": "FUB 500"},
+        "scoring": {"candidates": 5},
+    }) == ["parcels:travis", "preforeclosure:travis", "fub_push"]
+
+
+def test_mirror_asset_key_cleared_when_download_fails(monkeypatch, tmp_path):
+    """A stale key would let a daily run skip owner-change bookkeeping against
+    data that actually came from the TxGIO fallback."""
+    from seller_finder.sources import parcels
+
+    parcels._LAST_ASSET_KEY["bexar"] = "999:888"
+    monkeypatch.setattr(parcels, "_github_token", lambda: "")
+    assert parcels._download_from_mirror("bexar", tmp_path / "x.zip") is False
+    assert "bexar" not in parcels._LAST_ASSET_KEY
+
+
+def test_warm_tier_leads_are_never_traced_even_after_rescoring(db, monkeypatch):
+    """Budget rail: warm rows carry no lead row, so no trace can be charged."""
+    from seller_finder.skiptrace import tracer
+    _insert_parcel(db, prop_id="8101", absentee=1)
+    for _ in range(3):
+        compute_scores(db, [], [], {})
+    assert db.execute("SELECT COUNT(*) c FROM warm_leads").fetchone()["c"] == 1
+    assert db.execute("SELECT COUNT(*) c FROM leads").fetchone()["c"] == 0
+
+    class ExplodingProvider:
+        name = "boom"
+        def trace_batch(self, reqs):
+            raise AssertionError("warm-tier lead reached the paid API")
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": ExplodingProvider())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    stats = tracer.trace_qualified_leads(db)
+    assert stats["eligible"] == 0 and stats["traced"] == 0
+
+
+def test_budget_is_enforced_at_the_api_call_site(db, monkeypatch):
+    """The cap must bound what is SENT to the provider, not just what is
+    reported — assert on the request count the provider actually received."""
+    from seller_finder.skiptrace import tracer
+    for i in range(6):
+        _insert_parcel(db, prop_id=f"95{i}", owner=f"CAPOWNER{i} TEST",
+                       situs=f"{i} BUDGET LN", mail=f"{i} FAR AWAY RD")
+        compute_scores(db, [{"county": "bexar", "prop_id": f"95{i}",
+                             "kind": "mortgage", "doc_number": f"b{i}",
+                             "month": 8, "year": 2026}], [], {})
+    sent = {"n": 0}
+
+    class CountingProvider:
+        name = "count"
+        def trace_batch(self, reqs):
+            from seller_finder.skiptrace.base import SkipTraceResult
+            sent["n"] += len(reqs)
+            return [SkipTraceResult(matched=True, emails=["a@b.com"],
+                                    provider="count") for _ in reqs]
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": CountingProvider())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    monkeypatch.setattr(config, "MAX_SKIP_TRACES_PER_RUN", 3)
+    stats = tracer.trace_qualified_leads(db)
+    assert sent["n"] == 3, "budget must cap the provider request, not just the stats"
+    assert stats["traced"] == 3 and stats["budget_skipped"] == 3

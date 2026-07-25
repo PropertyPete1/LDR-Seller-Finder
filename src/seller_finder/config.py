@@ -73,9 +73,11 @@ WARM_TIER_MIN = SCORING.get("warm_tier_min", 30)
 # Counties enabled for this deployment. Add new counties in settings.yaml.
 COUNTIES = SETTINGS.get("counties", ["bexar", "comal"])
 
-# Skip-trace budget guard: max new (never-traced) owners per run, resolved
-# by run mode (settings.skip_trace_budget: {weekly: 75, daily: 15} ≈
-# $50-90/month at $0.15/trace). Env MAX_SKIP_TRACES_PER_RUN overrides both.
+# Skip-trace budget guard: max new (never-traced) owners per run, resolved by
+# run mode (settings.skip_trace_budget: {weekly: 75, daily: 15}). Scheduled
+# worst case = 705 traces ≈ $105.75/month at $0.15/trace. PER-RUN only — no
+# month-to-date ceiling is enforced anywhere.
+# Env MAX_SKIP_TRACES_PER_RUN overrides both.
 _BUDGETS = SETTINGS.get("skip_trace_budget", {}) or {}
 _DEFAULT_BUDGET = {"weekly": 75, "daily": 15}
 MAX_SKIP_TRACES_PER_RUN = int(

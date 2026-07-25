@@ -113,6 +113,12 @@ def _download_from_mirror(county: str, zip_path: Path) -> bool:
     Returns True on success. Works on Actions runners (github.com is always
     reachable there); the repo is private so an auth token is required.
     """
+    # Clear any key left over from a previous attempt: sync_county uses this to
+    # decide "snapshot unchanged → skip owner-change bookkeeping". If the mirror
+    # fails after we read the asset metadata and TxGIO serves DIFFERENT (newer)
+    # data instead, a stale key here would record the mirror's identity against
+    # TxGIO's rows and silently suppress bookkeeping on the next daily run.
+    _LAST_ASSET_KEY.pop(county, None)
     token = _github_token()
     if not token:
         LOGGER.warning("Mirror: no GitHub token available — skipping mirror source")
@@ -145,11 +151,13 @@ def _download_from_mirror(county: str, zip_path: Path) -> bool:
             LOGGER.warning("Mirror: size mismatch for %s (%d != %d)",
                            county, zip_path.stat().st_size, asset["size"])
             zip_path.unlink(missing_ok=True)
+            _LAST_ASSET_KEY.pop(county, None)
             return False
         return True
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Mirror download failed for %s: %s", county, exc)
         zip_path.unlink(missing_ok=True)
+        _LAST_ASSET_KEY.pop(county, None)
         return False
 
 

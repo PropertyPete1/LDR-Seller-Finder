@@ -74,15 +74,19 @@ def compute_scores(conn, foreclosure_matches: list[dict], divorce_matches: list[
             score += config.SCORE_ABSENTEE
             signals.append({"signal": "absentee_owner", "points": config.SCORE_ABSENTEE,
                             "detail": f"Owner mails to {p['mail_addr']}, {p['mail_city']} {p['mail_state']}"})
+        # Event signals record observed_at (the date the notice/filing was
+        # actually seen) so _carry_forward_events can expire them correctly.
         if key in dv_by_key:
             m = dv_by_key[key]
             score += config.SCORE_DIVORCE
             signals.append({"signal": "divorce_filing", "points": config.SCORE_DIVORCE,
+                            "observed_at": ts[:10],
                             "detail": f"Case {m['case_number']} (confidence {m['confidence']:.2f})"})
         if key in fc_by_key:
             m = fc_by_key[key]
             score += config.SCORE_PREFORECLOSURE
             signals.append({"signal": "preforeclosure", "points": config.SCORE_PREFORECLOSURE,
+                            "observed_at": ts[:10],
                             "detail": f"{m['kind'].title()} foreclosure notice doc #{m['doc_number']} "
                                       f"({m['month']}/{m['year']} sale)"})
         if _owned_ten_plus_years(conn, county, prop_id):
@@ -176,24 +180,42 @@ def _upsert_warm(conn, batch: list[tuple]) -> None:
 
 
 def _carry_forward_events(existing, signals, score, current_kinds, retention_days):
-    """Merge stored event signals into this run's signals (see compute_scores)."""
+    """Merge stored event signals into this run's signals (see compute_scores).
+
+    Each event signal carries its own `observed_at` — the run that actually saw
+    the notice/filing — and expires `retention_days` after THAT date.
+
+    It used to expire off the lead's `updated_at`, which compute_scores rewrites
+    on every single run. That made age_days ~0 forever, so retention_days never
+    fired and a one-off foreclosure notice kept its +30 for the life of the row.
+    Signals stored before this change have no observed_at; they are anchored to
+    the lead's updated_at once, on first sight, and expire normally after that.
+    """
     import datetime as _dt
     try:
         stored = json.loads(existing["signals"] or "[]")
     except (ValueError, TypeError):
         return score, signals
-    try:
-        age_days = (_dt.date.today()
-                    - _dt.date.fromisoformat((existing["updated_at"] or "")[:10])).days
-    except ValueError:
-        age_days = 0
-    if age_days > retention_days:
-        return score, signals
+    today = _dt.date.today()
+    fallback_anchor = (existing["updated_at"] or "")[:10]
     for s in stored:
-        if s.get("signal") in ("preforeclosure", "divorce_filing") \
-                and s["signal"] not in current_kinds:
-            signals.append(s)
-            score += int(s.get("points", 0))
+        if s.get("signal") not in ("preforeclosure", "divorce_filing"):
+            continue
+        if s["signal"] in current_kinds:
+            continue  # re-observed this run — the fresh signal already counted
+        observed = str(s.get("observed_at") or fallback_anchor)[:10]
+        try:
+            age_days = (today - _dt.date.fromisoformat(observed)).days
+        except ValueError:
+            age_days = 0
+        if age_days > retention_days:
+            LOGGER.info("Event signal %s expired (%d days > %d retention) — dropping",
+                        s["signal"], age_days, retention_days)
+            continue
+        carried = dict(s)
+        carried.setdefault("observed_at", observed)
+        signals.append(carried)
+        score += int(s.get("points", 0))
     return score, signals
 
 

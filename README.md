@@ -260,7 +260,7 @@ Skip tracing is the only per-unit cost in the system, so it is triple-guarded:
 
 1. **Threshold gate** — only leads scoring ≥ 40 are ever traced (absentee alone doesn't qualify).
 2. **Owner-level cache** — results are stored by normalized owner name + mailing ZIP in `skip_traces`. The same owner is **never billed twice**, across runs, properties, or counties. Within a single run, multi-property owners are traced once and the result attached to all their leads.
-3. **Per-run budget by mode** — `skip_trace_budget: {weekly: 75, daily: 15}` in settings.yaml. Worst case = 75 + 5×15 = 150 traces/week ≈ **$90/month** at the configured `skip_trace_cost_usd` ($0.15); in practice much lower because the owner cache never re-bills. Leads that miss the budget stay `qualified` and are picked up next run (highest scores first). `MAX_SKIP_TRACES_PER_RUN` env overrides both.
+3. **Per-run budget by mode** — `skip_trace_budget: {weekly: 75, daily: 15}` in settings.yaml. Worst case = 75 + 5×15 = 150 traces/week. Over a calendar month that is at most 5 weekly runs + 22 daily runs = **705 traces ≈ $105.75/month** at the configured `skip_trace_cost_usd` ($0.15); in practice much lower because the owner cache never re-bills. Leads that miss the budget stay `qualified` and are picked up next run (highest scores first). `MAX_SKIP_TRACES_PER_RUN` env overrides both.
 4. **Spend visibility** — every run's diagnostics table shows *traces this run × cost* and the month-to-date total (counted from the `skip_traces` cache timestamps); the Monday digest includes "Skip-trace spend this month: ~$X".
 
 BatchData filters TCPA-blacklisted numbers by default, and we store the `dnc` and `litigator` flags on every trace — flagged leads are pushed with a `DNC` tag (so nurture suppresses calls/texts) and the flags remain visible in the push-record CSV.
@@ -301,9 +301,31 @@ Everything else is **optional** and skipped gracefully when absent — no run wi
 
 | Secret(s) | What it unlocks | Without it |
 |---|---|---|
-| `BATCHDATA_API_KEY` | Skip tracing: owner phone numbers + emails on every qualified lead, with DNC/litigator flags, cached so no owner is billed twice. Sign up at [batchdata.io](https://batchdata.io) (pay-as-you-go, ~$0.07–0.12/match, budget-capped at 200/run) | Qualified leads still appear in the review CSV with full scores and signals, but with no contact info they are **held, not pushed to FUB** (uncontactable records are never pushed). They are retraced and pushed automatically once the key is added |
+| `BATCHDATA_API_KEY` | Skip tracing: owner phone numbers + emails on every qualified lead, with DNC/litigator flags, cached so no owner is billed twice. Sign up at [batchdata.io](https://batchdata.io) (pay-as-you-go, ~$0.07–0.12/match, budget-capped per run: 75 weekly / 15 daily) | Qualified leads still appear in the review CSV with full scores and signals, but with no contact info they are **held, not pushed to FUB** (uncontactable records are never pushed). They are retraced and pushed automatically once the key is added |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM` | Monday digest email to peter@lifestyledesignrealty.com (new leads, pushed/held counts, score breakdown). Reuse the exact same values from LDR-Automation-Clean's secrets (smtp.gmail.com / 587 / Gmail app password) | Same stats appear in the Actions run **job summary**; the lead list is in the `pending-leads` artifact |
 | `HEALTHCHECK_URL` | Dead-man's switch: healthchecks.io emails you if a weekly run silently stops. You already have an account (LDR-Automation-Clean uses it) — add a check with period = 1 week, grace = 2 days, copy its `https://hc-ping.com/…` URL | GitHub still emails you on workflow *failures*; you just won't be alerted if the schedule itself silently stops firing |
+
+### settings.yaml tunables (non-secret)
+
+Every key in `config/settings.yaml`, including the ones added by the volume upgrade:
+
+| Key | Default | What it does |
+|---|---|---|
+| `counties` | bexar, comal, travis | Counties processed each run |
+| `scoring.*` | see file | Signal point values |
+| `scoring.skip_trace_threshold` | 40 | Minimum score to spend money on a trace |
+| `scoring.warm_tier_min` | 30 | Floor of the warm tier (stored, never traced/pushed) |
+| `skip_trace_budget` | weekly 75 / daily 15 | Max NEW owners traced per run, by `RUN_MODE` |
+| `skip_trace_cost_usd` | 0.15 | Cost estimate used for spend reporting only |
+| `no_match_retrace_days` | 90 | How long a cached NO-MATCH blocks a re-trace |
+| `event_signal_retention_days` | 120 | How long a preforeclosure/divorce signal is carried forward after it was last observed |
+| `exemption_min_snapshot_ratio` | 0.5 | Skip homestead-removed detection if an exemption pull returns less than this fraction of the previous snapshot (truncation guard) |
+| `min_market_value` / `max_market_value` | 40000 / 2500000 | Parcel value band considered |
+| `parcel_sources` / `exemption_sources` / `foreclosure_sources` | see file | Per-county feed configuration |
+
+Non-secret environment overrides used by the workflows: `RUN_MODE` (`daily`\|`weekly`), `DRY_RUN`, `MAX_SKIP_TRACES_PER_RUN` (overrides `skip_trace_budget`), `LLM_MODEL`, `DATABASE_PATH`, `DATA_DIR`, `SETTINGS_PATH`, `REVIEW_DIR`.
+
+
 
 Adding any of these later requires **zero code changes** — add the secret and the next run picks it up.
 

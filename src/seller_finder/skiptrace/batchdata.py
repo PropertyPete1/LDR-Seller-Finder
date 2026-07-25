@@ -65,6 +65,18 @@ class BatchDataProvider(SkipTraceProvider):
             # no-match. The tracer must not cache these results.
             return [SkipTraceResult(provider=self.name, error=err) for _ in chunk]
 
+        # A 200 does not by itself mean success: BatchData wraps its own status
+        # in the body, and a token/permission problem can arrive as
+        # {"status": {"code": 401, ...}} under HTTP 200. Without this check the
+        # chunk falls through to the no-match path below and gets CACHED as
+        # genuine no-matches — the exact shape of the 403-became-64-no-matches
+        # bug, just one layer down.
+        body_err = self._body_level_error(data, len(chunk))
+        if body_err:
+            LOGGER.error("BatchData HTTP 200 but body reports failure (%d items): %s",
+                         len(chunk), body_err)
+            return [SkipTraceResult(provider=self.name, error=body_err) for _ in chunk]
+
         persons = data.get("results", {}).get("persons", [])
         # meta.results = {requestCount, matchCount, noMatchCount, errorCount}
         meta = (data.get("results", {}) or {}).get("meta", {}) or {}
@@ -153,6 +165,33 @@ class BatchDataProvider(SkipTraceProvider):
                 continue
             break  # 4xx (non-429) won't succeed on retry
         return None, last_err
+
+    @staticmethod
+    def _body_level_error(data: dict, n_items: int) -> str | None:
+        """Detect a failure reported inside a HTTP 200 body. None = healthy.
+
+        Two signals, both conservative — a normal all-no-match response (which
+        we DO want cached) reports code 200 and errorCount 0, so it passes.
+        """
+        if not isinstance(data, dict):
+            return f"HTTP 200 but response was {type(data).__name__}, not an object"
+        status = data.get("status")
+        if isinstance(status, dict):
+            code = status.get("code")
+            if isinstance(code, int) and code >= 400:
+                text = status.get("text") or status.get("message") or ""
+                return f"HTTP 200 but body status.code={code}: {str(text)[:300]}"
+        meta = (data.get("results") or {}).get("meta") or {}
+        counts = meta.get("results") if isinstance(meta.get("results"), dict) else meta
+        if isinstance(counts, dict):
+            try:
+                errors = int(counts.get("errorCount") or 0)
+            except (TypeError, ValueError):
+                errors = 0
+            if errors and errors >= n_items:
+                return (f"HTTP 200 but provider reported errorCount={errors} "
+                        f"for all {n_items} requested records")
+        return None
 
     @staticmethod
     def _addr_key(street: str, zip_code: str) -> str:

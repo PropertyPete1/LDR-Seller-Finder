@@ -148,6 +148,22 @@ CREATE TABLE IF NOT EXISTS parcel_snapshot_meta (
     absentee        INTEGER DEFAULT 0
 ) WITHOUT ROWID;
 
+-- Exactly-once ledger for CSVs dropped in data/inbox/ (Travis foreclosure
+-- notices, BCAD deed dates). Keyed by content hash, NOT by filename alone, so
+-- re-committing a corrected file with the same name is re-ingested while a
+-- byte-identical file is never processed twice. This lives in the COMMITTED
+-- state DB on purpose: the old approach renamed the file to *.done on the
+-- runner, but the runner never commits back to `main`, so every run
+-- re-ingested the same file.
+CREATE TABLE IF NOT EXISTS ingested_files (
+    kind            TEXT NOT NULL,      -- foreclosure | deeds
+    file_name       TEXT NOT NULL,
+    content_sha256  TEXT NOT NULL,
+    rows            INTEGER DEFAULT 0,
+    ingested_at     TEXT,
+    PRIMARY KEY (kind, file_name, content_sha256)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_leads_status ON leads (status);
 CREATE INDEX IF NOT EXISTS idx_leads_score ON leads (score);
 """
@@ -269,6 +285,46 @@ def _migrate_versioned(conn: sqlite3.Connection) -> None:
                 "re-tracing", len(stale), requeued)
         conn.execute("PRAGMA user_version = 2")
         conn.commit()
+
+    if version < 3:
+        # v3 (2026-07): data/inbox/*.csv used to be gitignored, so manual county
+        # exports never reached the Actions runner at all, and the *.done /
+        # *.imported rename that was supposed to make ingestion exactly-once was
+        # discarded with the runner. The ingested_files ledger (created in
+        # SCHEMA above) replaces it. Nothing to backfill — an empty ledger just
+        # means the first run after this migration ingests whatever is committed.
+        LOGGER.info("Migration v3: inbox ingest ledger active (data/inbox CSVs "
+                    "are now committed and de-duplicated by content hash)")
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+
+
+def file_sha256(path: Path) -> str:
+    """Content hash of an inbox file — the ledger key (see ingested_files)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def already_ingested(conn: sqlite3.Connection, kind: str, path: Path) -> bool:
+    """True if this exact file content has already been ingested for `kind`."""
+    return conn.execute(
+        "SELECT 1 FROM ingested_files WHERE kind=? AND file_name=? AND content_sha256=?",
+        (kind, path.name, file_sha256(path)),
+    ).fetchone() is not None
+
+
+def mark_ingested(conn: sqlite3.Connection, kind: str, path: Path, rows: int) -> None:
+    """Record a successful ingest so later runs skip this file (exactly-once)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO ingested_files "
+        "(kind, file_name, content_sha256, rows, ingested_at) VALUES (?,?,?,?,?)",
+        (kind, path.name, file_sha256(path), rows, now_iso()),
+    )
+    conn.commit()
 
 
 def owner_hash(owner_name: str) -> int:

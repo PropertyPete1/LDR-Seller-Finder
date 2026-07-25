@@ -31,6 +31,15 @@ FUB_SYSTEM_HEADERS = {
 }
 
 
+class FubSearchError(RuntimeError):
+    """A dedupe lookup could not be completed (network/HTTP failure).
+
+    This is NOT the same as "no existing person found". Treating a failed
+    search as a clean miss is how you create duplicate people in the CRM: the
+    push path must abort and retry on the next run instead of creating.
+    """
+
+
 def _auth():
     return (config.FUB_API_KEY, "")
 
@@ -58,7 +67,11 @@ def is_contactable(contact: dict) -> bool:
 
 
 def find_existing_person(emails: list[str], phones: list[str], address: str) -> str | None:
-    """Return FUB person id if a contact already exists (email → phone → address)."""
+    """Return FUB person id if a contact already exists (email → phone → address).
+
+    Raises FubSearchError if any lookup fails at the transport/HTTP level — a
+    None return must only ever mean "FUB answered, and there is no match".
+    """
     session = requests.Session()
     session.auth = _auth()
     session.headers.update(FUB_SYSTEM_HEADERS)
@@ -81,6 +94,12 @@ def find_existing_person(emails: list[str], phones: list[str], address: str) -> 
 
 
 def _search_people(session: requests.Session, params: dict) -> str | None:
+    """One dedupe lookup. Returns a person id, or None for a confirmed miss.
+
+    Any failure raises FubSearchError — see the class docstring. Swallowing it
+    and returning None used to turn a FUB outage into a burst of duplicate
+    people, because push_lead reads None as "safe to create".
+    """
     try:
         resp = session.get(f"{FUB_BASE}/people", params={**params, "limit": 1}, timeout=60)
         if resp.status_code == 429:
@@ -90,8 +109,9 @@ def _search_people(session: requests.Session, params: dict) -> str | None:
         people = resp.json().get("people", [])
         return str(people[0]["id"]) if people else None
     except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("FUB people search failed (%s): %s", params, exc)
-        return None
+        LOGGER.error("FUB people search FAILED (%s): %s — aborting push for this "
+                     "lead so we never create a duplicate", params, exc)
+        raise FubSearchError(f"FUB people search failed for {params}: {exc}") from exc
 
 
 def build_note(lead: dict) -> str:
@@ -149,7 +169,14 @@ def push_lead(conn, lead: dict) -> str | None:
         # Nurture system suppresses texting/calling anyone tagged DNC.
         tags.append("DNC")
 
-    existing_id = find_existing_person(contact["emails"], contact["phones"], lead["property_addr"])
+    try:
+        existing_id = find_existing_person(
+            contact["emails"], contact["phones"], lead["property_addr"])
+    except FubSearchError as exc:
+        # Dedupe could not be established — do NOT create. The lead keeps
+        # status 'awaiting_approval' and is retried on the next run.
+        LOGGER.error("Lead %s NOT pushed: dedupe lookup failed (%s)", lead["id"], exc)
+        return None
 
     lead["notes"] = generate_summary_note(lead)
     note_body = build_note(lead)
@@ -192,15 +219,24 @@ def push_lead(conn, lead: dict) -> str | None:
             person_id = str(resp.json()["id"])
             LOGGER.info("Created FUB person %s for lead %s", person_id, lead["id"])
 
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("FUB push failed for lead %s: %s", lead["id"], exc)
+        return None
+
+    # The person now exists in FUB. The note is best-effort from here on: if we
+    # returned None because the note POST failed, the lead would stay
+    # 'awaiting_approval' and the next run would push it again, adding a second
+    # note to the same person.
+    try:
         session.post(f"{FUB_BASE}/notes", json={
             "personId": int(person_id),
             "subject": f"Seller lead — score {lead['score']}/100",
             "body": note_body,
         }, timeout=60)
-        return person_id
     except Exception as exc:  # noqa: BLE001
-        LOGGER.error("FUB push failed for lead %s: %s", lead["id"], exc)
-        return None
+        LOGGER.warning("FUB note failed for lead %s (person %s already created/tagged): %s",
+                       lead["id"], person_id, exc)
+    return person_id
 
 
 def _push_batch(conn, leads, stats: dict) -> dict:
