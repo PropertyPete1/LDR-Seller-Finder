@@ -507,6 +507,71 @@ def test_legacy_migration_drops_parcels_and_salvages_state(tmp_path):
     conn.close()
 
 
+def test_provider_consumer_profile_is_never_stored(db, monkeypatch):
+    """skip_traces.raw must hold provenance only, never the provider's
+    consumer profile (relatives, address history, DOB). No code reads that
+    column, and at up to 100 KB/owner it also threatened the 100 MB cap."""
+    from seller_finder.skiptrace import tracer
+    from seller_finder.skiptrace.base import SkipTraceResult
+
+    _insert_parcel(db, prop_id="C001", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "C001", "kind": "mortgage",
+                         "doc_number": "1", "month": 8, "year": 2026}], [], {})
+
+    profile = {
+        "emails": [{"email": "a@b.com"}],
+        "phoneNumbers": [{"number": "2105551234"}],
+        "dateOfBirth": "1961-04-02",
+        "relatives": [{"name": "SMITH JANE", "age": 58}],
+        "addressHistory": [{"street": "9 PRIOR RD", "city": "AUSTIN"}],
+    }
+
+    class Prov:
+        name = "p"
+        def trace_batch(self, reqs):
+            return [SkipTraceResult(matched=True, emails=["a@b.com"],
+                                    phones=[{"number": "2105551234"}],
+                                    raw=profile, provider="p") for _ in reqs]
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": Prov())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    tracer.trace_qualified_leads(db)
+
+    stored = db.execute("SELECT raw, emails, phones FROM skip_traces").fetchone()
+    for leaked in ("1961-04-02", "SMITH JANE", "9 PRIOR RD", "AUSTIN"):
+        assert leaked not in stored["raw"], f"{leaked!r} leaked into skip_traces.raw"
+    # The contact info we actually paid for is still there, in its own columns.
+    assert json.loads(stored["emails"]) == ["a@b.com"]
+    assert json.loads(stored["phones"])[0]["number"] == "2105551234"
+    assert json.loads(stored["raw"])["email_count"] == 1
+
+
+def test_migration_v5_purges_stored_consumer_profiles(tmp_path):
+    """An existing state DB carries the old full payloads — purge on open,
+    without disturbing the cached match result (already paid for)."""
+    db_file = tmp_path / "pii.sqlite3"
+    conn = get_db(db_file, parcels_cache=tmp_path / "c1.sqlite3")
+    fat = json.dumps({"dateOfBirth": "1961-04-02",
+                      "relatives": [{"name": "SMITH JANE"}] * 50,
+                      "addressHistory": [{"street": "9 PRIOR RD"}] * 50})
+    conn.execute(
+        "INSERT INTO skip_traces (owner_key, provider, matched, emails, phones, "
+        "dnc, litigator, raw, traced_at) VALUES ('K|78201','batchdata',1,"
+        "'[\"a@b.com\"]','[]',0,0,?,?)", (fat, now_iso()))
+    conn.execute("PRAGMA user_version = 4")  # pretend pre-v5
+    conn.commit()
+    conn.close()
+
+    conn2 = get_db(db_file, parcels_cache=tmp_path / "c2.sqlite3")
+    row = conn2.execute("SELECT raw, matched, emails FROM skip_traces").fetchone()
+    assert "1961-04-02" not in row["raw"] and "SMITH JANE" not in row["raw"]
+    assert json.loads(row["raw"])["purged_by_migration"] == "v5"
+    # The billable facts survive — nobody gets re-traced or re-billed.
+    assert row["matched"] == 1 and json.loads(row["emails"]) == ["a@b.com"]
+    conn2.close()
+
+
 def test_state_size_guard(tmp_path, monkeypatch):
     from seller_finder.state import check_state_size
     small = tmp_path / "small.db"

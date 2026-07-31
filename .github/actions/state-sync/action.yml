@@ -49,7 +49,25 @@ runs:
           -in data/seller_finder.sqlite3 \
           -out /tmp/seller_finder.sqlite3.enc \
           -pass env:STATE_KEY
-        echo "✅ State DB encrypted ($(wc -c < /tmp/seller_finder.sqlite3.enc) bytes)"
+        ENC_BYTES=$(wc -c < /tmp/seller_finder.sqlite3.enc)
+        echo "✅ State DB encrypted ($ENC_BYTES bytes)"
+
+        # Size guard AT THE PUSH SITE. state.check_state_size() runs in the
+        # Python process, but every workflow runs this step with `if: always()`
+        # — so a run that failed the guard (or crashed before it) still reached
+        # here and pushed anyway. GitHub hard-rejects blobs over 100 MB, which
+        # would fail the push after the commit is already made and leave the
+        # state branch needing manual repair. Refuse before committing: the
+        # previous good state stays on the branch and the next run resumes
+        # from it.
+        MAX_BYTES=$((95 * 1000 * 1000))
+        if [ "$ENC_BYTES" -gt "$MAX_BYTES" ]; then
+          echo "::error::Encrypted state DB is $ENC_BYTES bytes (> $MAX_BYTES guard,"\
+               "GitHub's hard limit is 100 MB). REFUSING to push — the 'state' branch"\
+               "keeps its last good version. Investigate table growth (likely the"\
+               "warm_leads or skip_traces table) before the next run."
+          exit 1
+        fi
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git fetch origin state:state 2>/dev/null || true

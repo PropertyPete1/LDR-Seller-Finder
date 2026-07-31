@@ -158,7 +158,7 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (okey, result.provider, int(result.matched), json.dumps(result.emails),
                  json.dumps(result.phones), int(result.dnc), int(result.litigator),
-                 json.dumps(result.raw)[:100000], now_iso()),
+                 json.dumps(_provenance(result)), now_iso()),
             )
             trace_id = cur.lastrowid if cur.rowcount else conn.execute(
                 "SELECT id FROM skip_traces WHERE owner_key=?", (okey,)
@@ -186,6 +186,38 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
     _add_spend_stats(conn, stats)
     LOGGER.info("Skip tracing: %s", stats)
     return stats
+
+
+def _provenance(result) -> dict:
+    """What we keep from a provider response, beyond the extracted columns.
+
+    We used to store the entire BatchData person record (truncated at 100 KB).
+    Nothing ever read it — the pipeline only uses emails/phones/dnc/litigator,
+    which have their own columns — while it carried the full consumer profile
+    the provider returns: relatives, address history, age/DOB, associated
+    identities. Two problems with that:
+
+      * Data minimisation. This is homeowner PII in a repo whose whole
+        retention story is "encrypted state branch"; keeping identity data we
+        never look at is pure liability.
+      * Size. The committed DB has a hard 100 MB ceiling (GitHub rejects
+        larger blobs). At up to 100 KB per owner, ~900 traced owners could
+        blow the cap on this column alone.
+
+    Keep only non-identifying provenance: enough to audit what happened and
+    which provider/shape produced it.
+    """
+    raw = result.raw if isinstance(result.raw, dict) else {}
+    return {
+        "provider": result.provider,
+        "matched": bool(result.matched),
+        "email_count": len(result.emails or []),
+        "phone_count": len(result.phones or []),
+        "dnc": bool(result.dnc),
+        "litigator": bool(result.litigator),
+        # Field names only — never their values.
+        "response_fields": sorted(raw.keys())[:40],
+    }
 
 
 def _add_spend_stats(conn, stats: dict) -> None:

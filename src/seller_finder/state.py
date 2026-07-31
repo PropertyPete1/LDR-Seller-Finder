@@ -75,7 +75,9 @@ CREATE TABLE IF NOT EXISTS skip_traces (
     phones          TEXT,               -- JSON list of dicts
     dnc             INTEGER DEFAULT 0,
     litigator       INTEGER DEFAULT 0,
-    raw             TEXT,               -- full JSON response for the person
+    raw             TEXT,               -- provenance stub only, NEVER the
+                                        -- provider's consumer profile (see
+                                        -- tracer._provenance and migration v5)
     traced_at       TEXT
 );
 
@@ -318,6 +320,44 @@ def _migrate_versioned(conn: sqlite3.Connection) -> None:
         LOGGER.info("Migration v4: divorce match-attempt cap active")
         conn.execute("PRAGMA user_version = 4")
         conn.commit()
+
+    if version < 5:
+        # v5 (2026-07): purge stored provider consumer profiles.
+        # skip_traces.raw held the entire BatchData person record (up to
+        # 100 KB each) — relatives, address history, age/DOB, associated
+        # identities. NO code path has ever read that column: the pipeline
+        # uses the emails/phones/dnc/litigator columns beside it. Keeping
+        # identity data we never look at is liability in a repo holding
+        # homeowner PII, and at 100 KB/owner it also threatens the 100 MB
+        # committed-DB ceiling on its own.
+        #
+        # This drops PII and cannot be undone. It is safe because the column
+        # is provably unread, and the billable facts (matched + contact info)
+        # live in their own columns and are untouched — no owner gets
+        # re-traced or re-billed as a result.
+        rows = conn.execute(
+            "SELECT COUNT(*) c FROM skip_traces WHERE raw IS NOT NULL "
+            "AND LENGTH(raw) > 400").fetchone()["c"]
+        if rows:
+            conn.execute(
+                "UPDATE skip_traces SET raw=json_object("
+                "  'purged_by_migration', 'v5',"
+                "  'provider', provider,"
+                "  'matched', matched,"
+                "  'dnc', dnc,"
+                "  'litigator', litigator) "
+                "WHERE raw IS NOT NULL AND LENGTH(raw) > 400")
+            LOGGER.info(
+                "Migration v5: purged stored provider consumer profiles from %d "
+                "skip_traces row(s) (data minimisation; column was never read). "
+                "Cached match results and contact info are untouched.", rows)
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+        if rows:
+            # After the commit: VACUUM cannot run inside a transaction, and it
+            # is what actually reclaims the freed pages so the committed file
+            # shrinks rather than just carrying free space.
+            conn.execute("VACUUM")
 
 
 def file_sha256(path: Path) -> str:
