@@ -20,7 +20,9 @@ env:
   DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   FUB_API_KEY: ${{ secrets.FUB_API_KEY }}
-  HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+  # HEALTHCHECK_URL deliberately NOT passed: this workflow is manual and shares
+  # the check with the two cron runs. Pinging it green from a hand-triggered
+  # retry would reset the dead-man's switch and mask a cron that stopped firing.
   LLM_MODEL: claude-sonnet-4-6
   DATABASE_PATH: "data/seller_finder.sqlite3"
 jobs:

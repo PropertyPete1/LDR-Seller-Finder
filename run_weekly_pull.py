@@ -109,15 +109,17 @@ def main() -> int:
         LOGGER.error("FUB auto-push failed: %s", exc, exc_info=True)
         stats["fub_push"] = {"error": str(exc)}
 
-    # 8. Run-record artifacts (CSV documents what was pushed/held)
-    stats["review"] = write_review_files(conn, run_stats=stats)
-
-    # 9. Digest + heartbeat + committed-DB size guard
-    stats["digest_sent"] = send_digest_email(conn, run_stats=stats)
-    # See run_daily_pull: per-stage try/except would otherwise let a totally
-    # failed run exit 0 and ping the dead-man's switch green.
+    # 8. Health verdict — computed BEFORE the artifacts so the run summary can
+    # lead with it. Per-stage try/except would otherwise let a totally failed
+    # run exit 0 and ping the dead-man's switch green.
     failures = collect_stage_errors(stats)
     stats["stage_failures"] = failures
+
+    # 9. Run-record artifacts (CSV documents what was pushed/held)
+    stats["review"] = write_review_files(conn, run_stats=stats)
+
+    # 10. Digest + heartbeat + committed-DB size guard
+    stats["digest_sent"] = send_digest_email(conn, run_stats=stats)
     record_run(conn, "weekly_pull", started, stats)
     conn.commit()
     conn.close()
@@ -132,4 +134,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # A crash outside the per-stage guards (scoring, tracing, the size guard)
+    # would otherwise leave the dead-man's switch untouched: the workflow goes
+    # red, but healthchecks.io keeps waiting quietly for a ping that never
+    # comes and only alerts a week later. Say it now.
+    try:
+        sys.exit(main())
+    except BaseException:
+        LOGGER.exception("Weekly pull CRASHED — pinging healthcheck FAIL")
+        ping_healthcheck(failed=True)
+        raise

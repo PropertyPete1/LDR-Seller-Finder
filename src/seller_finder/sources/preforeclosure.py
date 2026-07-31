@@ -114,6 +114,7 @@ def _fetch_from_inbox(county: str, conn=None) -> list[dict]:
     """
     inbox = config.DATA_DIR / "inbox"
     notices: list[dict] = []
+    errors: list[str] = []
     if not inbox.exists():
         LOGGER.info("%s: no live foreclosure feed and no inbox dir — 0 notices", county)
         return notices
@@ -144,7 +145,14 @@ def _fetch_from_inbox(county: str, conn=None) -> list[dict]:
             LOGGER.info("%s: ingested foreclosure inbox file %s (%d notices)",
                         county, path.name, len(file_notices))
         except Exception as exc:  # noqa: BLE001
+            # A hand-committed county export that fails to parse must not be
+            # a log line nobody reads — fetch() re-raises so the run records it.
             LOGGER.error("%s: failed to ingest %s: %s", county, path.name, exc)
+            errors.append(f"{path.name}: {exc}")
+    if errors and not notices:
+        raise FeedUnavailable(
+            f"every foreclosure inbox file for {county} failed to parse "
+            f"({'; '.join(errors)}) — treating as UNKNOWN, not as zero notices")
     LOGGER.info("Foreclosure notices for %s (inbox): %d", county, len(notices))
     return notices
 

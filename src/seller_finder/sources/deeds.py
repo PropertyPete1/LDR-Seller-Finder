@@ -95,7 +95,7 @@ def ingest_inbox(conn) -> dict:
     """Ingest all deed CSVs waiting in data/inbox/, exactly once per file
     content (see the `ingested_files` ledger in state.py)."""
     inbox = config.DATA_DIR / "inbox"
-    stats = {"files": 0, "rows": 0}
+    stats: dict = {"files": 0, "rows": 0, "file_errors": []}
     if not inbox.exists():
         return stats
     seen = set()
@@ -111,7 +111,11 @@ def ingest_inbox(conn) -> dict:
                 rows = ingest_file(conn, path)
                 mark_ingested(conn, "deeds", path, rows)
             except Exception as exc:  # noqa: BLE001 — a bad file must not kill the run
+                # Recorded, not just logged: this file is a manual export Peter
+                # committed on purpose, so it silently doing nothing is a
+                # failure. collect_stage_errors reads file_errors.
                 LOGGER.error("Deed import failed for %s: %s", path.name, exc)
+                stats["file_errors"].append(f"{path.name}: {exc}")
                 continue
             stats["files"] += 1
             stats["rows"] += rows

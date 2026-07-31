@@ -14,9 +14,9 @@ import sys
 sys.path.insert(0, "src")
 
 from seller_finder import config  # noqa: E402
-from seller_finder.state import get_db, now_iso, record_run  # noqa: E402
+from seller_finder.state import get_db, now_iso, record_run, check_state_size  # noqa: E402
 from seller_finder.fub import push_approved_leads  # noqa: E402
-from seller_finder.health import ping_healthcheck  # noqa: E402
+from seller_finder.health import collect_stage_errors  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("push_approved")
@@ -46,8 +46,22 @@ def main() -> int:
     LOGGER.info("=== Push approved — DRY_RUN=%s ===", config.DRY_RUN)
     stats = push_approved_leads(conn)
     record_run(conn, "push_approved", started, stats)
-    ping_healthcheck()
+    conn.commit()
+    conn.close()
+    stats["state_db_mb"] = round(check_state_size(), 1)
+
+    # NO healthcheck ping here, deliberately. This workflow is manual
+    # (workflow_dispatch) and shares HEALTHCHECK_URL with the two cron runs.
+    # Pinging it green would reset the dead-man's switch — so a hand-run
+    # retry would mask exactly the thing the switch exists to catch: the
+    # weekly cron silently no longer firing.
+    failures = collect_stage_errors({"fub_push": stats})
     LOGGER.info("=== Push complete: %s ===", stats)
+    if failures:
+        # Previously returned 0 unconditionally, so a run where every push
+        # failed reported success and the workflow went green.
+        LOGGER.error("Push finished with failures: %s", ", ".join(failures))
+        return 1
     return 0
 
 

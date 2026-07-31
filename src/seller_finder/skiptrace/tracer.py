@@ -130,9 +130,15 @@ def trace_qualified_leads(conn, provider_name: str = "batchdata") -> dict:
         queued_keys[okey] = []
 
     if config.DRY_RUN:
-        LOGGER.info("[DRY-RUN] Would skip-trace %d owners", len(to_trace))
+        LOGGER.info("[DRY-RUN] Would skip-trace %d owners (budget %d, %s run)",
+                    len(to_trace), budget, config.RUN_MODE)
         conn.commit()
         stats["traced"] = 0
+        stats["would_trace"] = len(to_trace)
+        # Still report month-to-date spend: a dry run is how you check the
+        # budget before a real one, and this early return used to skip it,
+        # leaving the diagnostics table showing $0.00 MTD.
+        _add_spend_stats(conn, stats)
         return stats
 
     if to_trace:

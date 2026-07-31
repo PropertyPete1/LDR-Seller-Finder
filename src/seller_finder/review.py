@@ -143,9 +143,17 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
                 f"(owner changes {p.get('owner_changes', 0)}) |")
         ex = c.get("exemptions")
         if ex is not None:
-            lines.append(
-                f"| Exemptions | {county} | {ex.get('updated', 0):,} rows, homestead "
-                f"{ex.get('homestead', 0):,} |")
+            if ex.get("error"):
+                lines.append(f"| Exemptions | {county} | ❌ ERROR: {str(ex['error'])[:120]} |")
+            elif ex.get("truncated_feed"):
+                lines.append(
+                    f"| Exemptions | {county} | ⚠️ **TRUNCATED FEED** — snapshot kept, "
+                    f"homestead-removed detection SKIPPED this run |")
+            else:
+                lines.append(
+                    f"| Exemptions | {county} | {ex.get('updated', 0):,} rows, homestead "
+                    f"{ex.get('homestead', 0):,}, removed "
+                    f"{ex.get('removed_count', 0):,} |")
         fc = c.get("preforeclosure")
         if fc is not None:
             lines.append(
@@ -155,8 +163,12 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
     lines.append(f"| Divorce | bexar | {dv.get('filings', 0)} filings → "
                  f"{dv.get('matched', 0)} matched (stubbed source) |")
     de = run_stats.get("deeds") or {}
-    lines.append(f"| Deed dates | — | {de.get('files', 0)} inbox files, "
-                 f"{de.get('rows', 0):,} rows |")
+    deed_cell = (f"{de.get('files', 0)} inbox files, {de.get('rows', 0):,} rows, "
+                 f"{de.get('total_deed_dates', 0):,} total stored")
+    if de.get("file_errors"):
+        deed_cell += (f" — ❌ **{len(de['file_errors'])} file(s) UNREADABLE**: "
+                      f"{'; '.join(str(e)[:80] for e in de['file_errors'])}")
+    lines.append(f"| Deed dates | — | {deed_cell} |")
     sc = run_stats.get("scoring") or {}
     lines.append(
         f"| Scoring | all | candidates {sc.get('candidates', 0):,} → qualified "
@@ -198,11 +210,39 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
     return lines
 
 
+def _verdict_md(run_stats: dict | None) -> list[str]:
+    """Run health, stated first and in plain language.
+
+    The diagnostics table below shows everything, but it is long and a reader
+    scanning a green checkmark will not audit twelve rows. Whatever failed goes
+    at the top, before any counts — those counts are exactly what look
+    reassuring when a stage produced nothing.
+    """
+    if not run_stats:
+        return []
+    failures = run_stats.get("stage_failures")
+    if failures is None:  # summary written before the verdict was computed
+        return []
+    if not failures:
+        return ["", "✅ **All pipeline stages healthy.**", ""]
+    return [
+        "",
+        f"## ❌ {len(failures)} STAGE(S) FAILED THIS RUN",
+        "",
+        *[f"- `{f}`" for f in failures],
+        "",
+        "The run exited non-zero and healthchecks.io was pinged FAIL. See the "
+        "diagnostics table below and the Actions log for the underlying error.",
+        "",
+    ]
+
+
 def render_summary_md(stats: dict, pending: int, run_stats: dict | None = None) -> str:
     lines = [
         f"# LDR-Seller-Finder — {config.RUN_MODE.title()} Run Summary",
         "",
         f"**Run date:** {dt.datetime.now(config.CT):%Y-%m-%d %H:%M %Z}",
+        *_verdict_md(run_stats),
         "",
         f"| Metric | Value |",
         f"|---|---|",

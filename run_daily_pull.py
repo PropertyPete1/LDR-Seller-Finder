@@ -86,14 +86,15 @@ def main() -> int:
         LOGGER.error("FUB auto-push failed: %s", exc, exc_info=True)
         stats["fub_push"] = {"error": str(exc)}
 
-    # 6. Artifacts + heartbeat (no digest email on daily runs)
-    stats["review"] = write_review_files(conn, run_stats=stats)
+    # 6. Health verdict, then artifacts + heartbeat (no digest on daily runs).
     # Every stage above is wrapped in try/except so one bad county can't kill
     # the run — which also means the process would exit 0 and ping the
     # dead-man's switch green after a total failure. Convert the swallowed
-    # errors into a run-level verdict.
+    # errors into a run-level verdict, and do it BEFORE writing the summary so
+    # the summary can lead with it.
     failures = collect_stage_errors(stats)
     stats["stage_failures"] = failures
+    stats["review"] = write_review_files(conn, run_stats=stats)
     record_run(conn, "daily_pull", started, stats)
     conn.commit()
     conn.close()
@@ -108,4 +109,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # See run_weekly_pull: a crash outside the per-stage guards must still trip
+    # the dead-man's switch, not leave it quietly waiting.
+    try:
+        sys.exit(main())
+    except BaseException:
+        LOGGER.exception("Daily pull CRASHED — pinging healthcheck FAIL")
+        ping_healthcheck(failed=True)
+        raise

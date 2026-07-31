@@ -130,6 +130,10 @@ def sync_county(conn, county: str) -> dict:
         "VALUES (?,?,?,?)", current)
     stats["updated"] = len(current)
     stats["homestead"] = len(seen_hs)
+    # Kept as a count too: the runner pops the prop_id list off these stats to
+    # feed scoring, so the diagnostics table would otherwise have nothing to
+    # show for the signal this whole module exists to produce.
+    stats["removed_count"] = len(stats["homestead_removed"])
     conn.commit()
     LOGGER.info(
         "Exemption sync %s: updated=%d homestead=%d removed=%d",

@@ -1430,12 +1430,124 @@ def test_collect_stage_errors_finds_swallowed_failures():
     from seller_finder.health import collect_stage_errors
     assert collect_stage_errors({}) == []
     assert collect_stage_errors({
-        "counties": {"bexar": {"parcels": {"rows": 10}},
+        "counties": {"bexar": {"parcels": {"rows": 10, "kept": 8}},
                      "travis": {"parcels": {"error": "403 blocked"},
                                 "preforeclosure": {"error": "feed down"}}},
         "fub_push": {"error": "FUB 500"},
         "scoring": {"candidates": 5},
     }) == ["parcels:travis", "preforeclosure:travis", "fub_push"]
+
+
+def test_healthy_run_reports_no_failures():
+    """Over-correction guard: a normal run must stay clean, including a run
+    with a partial (not total) skip-trace error rate and zero pushes because
+    everything was legitimately held."""
+    from seller_finder.health import collect_stage_errors
+    assert collect_stage_errors({
+        "counties": {"bexar": {"parcels": {"rows": 700000, "kept": 400000,
+                                           "absentee": 150000},
+                               "exemptions": {"updated": 405000, "homestead": 400000},
+                               "preforeclosure": {"notices": 457, "matched": 50}}},
+        "scoring": {"candidates": 180000, "qualified": 60},
+        "skiptrace": {"eligible": 60, "traced": 55, "matched": 40, "errors": 5},
+        "fub_push": {"pushed": 0, "held_no_contact": 40, "failed": 0, "total": 40},
+        "deeds": {"files": 0, "rows": 0, "file_errors": []},
+    }) == []
+
+
+def test_total_skiptrace_failure_is_a_run_failure():
+    """The 403 incident: 50 eligible leads, every trace errored, nothing cached.
+
+    This exited 0 and pinged the dead-man's switch GREEN — the failure was
+    visible only to someone reading the diagnostics table row by row.
+    """
+    from seller_finder.health import collect_stage_errors
+    failures = collect_stage_errors({
+        "counties": {"bexar": {"parcels": {"rows": 700000, "kept": 400000}}},
+        "skiptrace": {"eligible": 50, "traced": 0, "matched": 0, "no_match": 0,
+                      "errors": 50, "top_error": "HTTP 403: Forbidden"},
+    })
+    assert "skiptrace-all-errors" in failures
+
+
+def test_total_fub_push_failure_is_a_run_failure():
+    from seller_finder.health import collect_stage_errors
+    assert "fub_push-all-failed" in collect_stage_errors({
+        "fub_push": {"pushed": 0, "held_no_contact": 0, "failed": 42, "total": 42}})
+
+
+def test_zero_row_parcel_sync_is_a_run_failure():
+    """A blocked mirror / changed GDB schema yields an empty candidate
+    universe. Every downstream count is then legitimately 0 and the run looks
+    like a quiet week."""
+    from seller_finder.health import collect_stage_errors
+    assert collect_stage_errors({
+        "counties": {"bexar": {"parcels": {"rows": 0, "kept": 0, "absentee": 0}}},
+    }) == ["parcels-empty:bexar"]
+    # rows arrived but every one was filtered out — a field-name change
+    assert collect_stage_errors({
+        "counties": {"comal": {"parcels": {"rows": 103537, "kept": 0}}},
+    }) == ["parcels-empty:comal"]
+
+
+def test_truncated_exemption_feed_is_a_run_failure():
+    """The guard keeps the old snapshot (correct) but that means the signal
+    silently did not run — which must not be reported as a healthy stage."""
+    from seller_finder.health import collect_stage_errors
+    assert collect_stage_errors({
+        "counties": {"bexar": {"parcels": {"kept": 10},
+                               "exemptions": {"updated": 0, "truncated_feed": True}}},
+    }) == ["exemptions-truncated:bexar"]
+
+
+def test_unreadable_inbox_file_is_a_run_failure():
+    """A county export Peter committed by hand that fails to parse used to be
+    a single ERROR log line in a 10,000-line Actions log."""
+    from seller_finder.health import collect_stage_errors
+    assert collect_stage_errors({
+        "deeds": {"files": 0, "rows": 0,
+                  "file_errors": ["deeds_bexar.csv: 'utf-8' codec can't decode"]},
+    }) == ["deeds-inbox-unreadable"]
+
+
+def test_run_summary_leads_with_the_failure_verdict(db, tmp_path, monkeypatch):
+    """The verdict must be at the TOP of the job summary, above the counts —
+    the counts are exactly what look reassuring when a stage produced nothing."""
+    from seller_finder import review
+    monkeypatch.setattr(config, "REVIEW_DIR", tmp_path / "review")
+    out = review.write_review_files(db, run_stats={
+        "counties": {}, "stage_failures": ["skiptrace-all-errors", "parcels-empty:bexar"],
+        "skiptrace": {"errors": 50, "traced": 0, "top_error": "HTTP 403: Forbidden"}})
+    md = (tmp_path / "review" / "run_summary.md").read_text()
+    assert "STAGE(S) FAILED" in md
+    assert md.index("STAGE(S) FAILED") < md.index("Score breakdown")
+    assert "skiptrace-all-errors" in md and "parcels-empty:bexar" in md
+    assert out["pending"] == 0
+
+
+def test_run_summary_says_healthy_when_clean(db, tmp_path, monkeypatch):
+    from seller_finder import review
+    monkeypatch.setattr(config, "REVIEW_DIR", tmp_path / "review")
+    review.write_review_files(db, run_stats={"counties": {}, "stage_failures": []})
+    md = (tmp_path / "review" / "run_summary.md").read_text()
+    assert "All pipeline stages healthy" in md
+
+
+def test_push_approved_does_not_reset_the_dead_mans_switch(monkeypatch):
+    """run_push_approved is manual and shares HEALTHCHECK_URL with the crons.
+
+    Pinging it green would reset the switch, masking the one thing it exists
+    to catch: the weekly cron silently no longer firing.
+    """
+    import subprocess
+    from pathlib import Path as _P
+    repo = _P(__file__).resolve().parents[1]
+    src = (repo / "run_push_approved.py").read_text()
+    assert "ping_healthcheck" not in src, (
+        "run_push_approved.py must not ping the shared healthcheck — a manual "
+        "retry would reset the dead-man's switch for the scheduled runs")
+    # And it must still fail loudly on its own terms.
+    assert "collect_stage_errors" in src and "return 1" in src
 
 
 def test_mirror_asset_key_cleared_when_download_fails(monkeypatch, tmp_path):
