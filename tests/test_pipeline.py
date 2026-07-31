@@ -186,7 +186,16 @@ def test_skip_trace_cache_prevents_double_billing(db, monkeypatch):
 
     stats1 = tracer.trace_qualified_leads(db)
     assert stats1["traced"] == 1  # same owner both parcels → one billable trace
-    assert stats1["cached"] == 1 or calls["n"] == 1
+    # `or` used to let either half carry the assertion, so a regression in one
+    # passed silently. Both must hold: exactly one request left the process,
+    # and the second lead was satisfied from the within-run cache.
+    assert calls["n"] == 1, "the same owner must be sent to the provider once"
+    assert stats1["cached"] == 1
+    # ...and BOTH leads end up attached to that single paid trace.
+    rows = db.execute(
+        "SELECT prop_id, status, skip_trace_id FROM leads ORDER BY prop_id").fetchall()
+    assert [r["status"] for r in rows] == ["traced", "traced"]
+    assert rows[0]["skip_trace_id"] == rows[1]["skip_trace_id"] is not None
 
 
 # ── Skip-trace error handling (errors are NOT no-matches) ────────────
@@ -704,21 +713,86 @@ def test_auto_push_skipped_without_fub_key(db, monkeypatch):
 
 
 def test_dnc_flag_adds_dnc_tag(db, monkeypatch):
+    """The DNC tag must reach FUB on the create path.
+
+    Rewritten: the previous version built the tag list in the test body and
+    then asserted its own list contained "DNC". It passed whatever push_lead
+    did — including doing nothing at all — because production code never ran.
+    Now it captures the payload push_lead actually sends.
+    """
     from seller_finder import fub
     lead_id = _make_awaiting_lead(db, "7004", phones='[{"number": "2105551234"}]', dnc=1)
     lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
-    captured = {}
 
-    monkeypatch.setattr(config, "DRY_RUN", True)  # dry-run: logs tags, no HTTP
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
     monkeypatch.setattr(fub, "find_existing_person", lambda *a, **k: None)
     monkeypatch.setattr(fub, "generate_summary_note", lambda lead: "")
-    # Verify tag construction directly via _lead_contact + logic
-    contact = fub._lead_contact(db, lead)
-    assert contact["dnc"] is True
-    tags = [config.TAG_SELLER, config.TAG_BY_SOURCE.get(lead["primary_source"], "County-Absentee")]
-    if contact["dnc"] or contact["litigator"]:
-        tags.append("DNC")
-    assert "DNC" in tags
+
+    sent = {}
+
+    class Resp:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"id": 4242}
+
+    class Session:
+        auth = None
+        headers = {}
+        def update(self, *a, **k):
+            return None
+        def get(self, *a, **k):
+            return Resp()
+        def post(self, url, json=None, **k):
+            if "/people" in url:
+                sent["payload"] = json
+            return Resp()
+    monkeypatch.setattr(fub.requests, "Session", lambda: Session())
+
+    assert fub.push_lead(db, lead) == "4242"
+    assert "DNC" in sent["payload"]["tags"]
+    assert config.TAG_SELLER in sent["payload"]["tags"]
+    assert "Pre-Foreclosure" in sent["payload"]["tags"]
+
+
+def test_no_dnc_flag_means_no_dnc_tag(db, monkeypatch):
+    """Over-correction guard: a clean owner must not be tagged DNC, or the
+    nurture system would suppress outreach to every lead we push."""
+    from seller_finder import fub
+    lead_id = _make_awaiting_lead(db, "7005b", phones='[{"number": "2105559999"}]', dnc=0)
+    lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "find_existing_person", lambda *a, **k: None)
+    monkeypatch.setattr(fub, "generate_summary_note", lambda lead: "")
+
+    sent = {}
+
+    class Resp:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"id": 5}
+
+    class Session:
+        auth = None
+        headers = {}
+        def update(self, *a, **k):
+            return None
+        def get(self, *a, **k):
+            return Resp()
+        def post(self, url, json=None, **k):
+            if "/people" in url:
+                sent["payload"] = json
+            return Resp()
+    monkeypatch.setattr(fub.requests, "Session", lambda: Session())
+
+    fub.push_lead(db, lead)
+    assert "DNC" not in sent["payload"]["tags"]
 
 
 def test_held_leads_eligible_for_retrace(db, monkeypatch):
@@ -1188,17 +1262,186 @@ def test_divorce_inbox_dir_follows_data_dir(tmp_path, monkeypatch):
 
 # ── Light sync (daily runs) ──────────────────────────────────────────────
 
-def test_parcel_snapshot_meta_written(db):
-    """sync_county records the mirror asset key so daily runs can light-sync."""
+@pytest.fixture
+def clean_asset_key():
+    """_LAST_ASSET_KEY is module-global. Tests that write it must not leak into
+    each other — one test asserting a key is ABSENT and another setting it made
+    the pair order-dependent."""
     from seller_finder.sources import parcels as pmod
-    pmod._LAST_ASSET_KEY["bexar"] = "123:456"
-    db.execute(
-        "INSERT INTO parcel_snapshot_meta (county, asset_key, synced_at, kept, absentee) "
-        "VALUES ('bexar', '123:456', ?, 10, 5)", (now_iso(),))
+    saved = dict(pmod._LAST_ASSET_KEY)
+    pmod._LAST_ASSET_KEY.clear()
+    yield pmod._LAST_ASSET_KEY
+    pmod._LAST_ASSET_KEY.clear()
+    pmod._LAST_ASSET_KEY.update(saved)
+
+
+def _fake_gdb_rows(n=3, owner="SMITH JOHN"):
+    """Rows in the shape read_gdb_rows yields, so sync_county runs for real."""
+    return [{"prop_id": str(1000 + i), "owner_name": owner,
+             "situs_addr": f"{i} MAIN ST", "situs_city": "SAN ANTONIO",
+             "situs_zip": "78201", "mail_addr": f"{i} FAR AWAY RD",
+             "mail_city": "AUSTIN", "mail_state": "TX", "mail_zip": "78701",
+             "mkt_value": 250000.0, "tax_year": 2025} for i in range(n)]
+
+
+def test_sync_county_records_mirror_asset_key(db, monkeypatch, clean_asset_key, tmp_path):
+    """sync_county must persist the asset key it actually synced from.
+
+    Rewritten: the previous version inserted the row itself and asserted it
+    equalled a global it had also set — production code never ran, so the
+    light-sync bookkeeping this guards was entirely untested.
+    """
+    from seller_finder.sources import parcels as pmod
+    monkeypatch.setattr(pmod, "read_gdb_rows", lambda p: iter(_fake_gdb_rows()))
+    clean_asset_key["bexar"] = "777:12345"
+
+    stats = pmod.sync_county(db, "bexar", gdb_path=tmp_path / "fake.gdb")
+    assert stats["kept"] == 3 and stats["absentee"] == 3
+    row = db.execute(
+        "SELECT asset_key, kept, absentee FROM parcel_snapshot_meta "
+        "WHERE county='bexar'").fetchone()
+    assert row["asset_key"] == "777:12345"
+    assert row["kept"] == 3 and row["absentee"] == 3
+
+
+def test_light_sync_skips_bookkeeping_only_when_snapshot_unchanged(
+        db, monkeypatch, clean_asset_key, tmp_path):
+    """The daily light-sync optimisation: identical mirror asset => skip the
+    owner-change writes. A CHANGED asset must re-run them, or an owner change
+    landing in a quarterly refresh would be missed forever."""
+    from seller_finder.sources import parcels as pmod
+    monkeypatch.setattr(pmod, "read_gdb_rows", lambda p: iter(_fake_gdb_rows()))
+    clean_asset_key["bexar"] = "777:12345"
+    pmod.sync_county(db, "bexar", gdb_path=tmp_path / "fake.gdb")
+    assert db.execute(
+        "SELECT COUNT(*) c FROM owners_first_seen WHERE county='bexar'").fetchone()["c"] == 3
+
+    # Same asset -> light sync skips bookkeeping.
+    stats = pmod.sync_county(db, "bexar", gdb_path=tmp_path / "fake.gdb", light=True)
+    assert stats["light_sync"] is True and stats["owner_changes"] == 0
+
+    # New owner AND a new asset key -> bookkeeping must run and see the change.
+    monkeypatch.setattr(pmod, "read_gdb_rows",
+                        lambda p: iter(_fake_gdb_rows(owner="JONES MARY")))
+    clean_asset_key["bexar"] = "888:99999"
+    stats = pmod.sync_county(db, "bexar", gdb_path=tmp_path / "fake.gdb", light=True)
+    assert stats["light_sync"] is False, "a changed mirror asset must not light-sync"
+    assert stats["owner_changes"] == 3
+    assert db.execute(
+        "SELECT COUNT(*) c FROM owner_history WHERE county='bexar'").fetchone()["c"] == 3
+
+
+def test_light_sync_still_rebuilds_the_parcel_cache(db, monkeypatch, clean_asset_key, tmp_path):
+    """pc.parcels is ephemeral — even a skipped-bookkeeping run must repopulate
+    it, or scoring and foreclosure address matching have nothing to work with."""
+    from seller_finder.sources import parcels as pmod
+    monkeypatch.setattr(pmod, "read_gdb_rows", lambda p: iter(_fake_gdb_rows()))
+    clean_asset_key["bexar"] = "777:12345"
+    pmod.sync_county(db, "bexar", gdb_path=tmp_path / "fake.gdb")
+    db.execute("DELETE FROM pc.parcels")          # simulate a fresh runner
     db.commit()
-    prev = db.execute(
-        "SELECT asset_key FROM parcel_snapshot_meta WHERE county='bexar'").fetchone()
-    assert prev["asset_key"] == pmod._LAST_ASSET_KEY["bexar"]
+    pmod.sync_county(db, "bexar", gdb_path=tmp_path / "fake.gdb", light=True)
+    assert db.execute(
+        "SELECT COUNT(*) c FROM pc.parcels WHERE county='bexar'").fetchone()["c"] == 3
+
+
+# ── Production entry points actually import ──────────────────────────────
+# This file starts with `sys.path.insert(0, .../src)`, which is a test-harness
+# convenience the real runners do not get: they do `sys.path.insert(0, "src")`,
+# relative to the working directory, and are invoked as `python3 run_*.py` from
+# the repo root by the workflows. Nothing here exercised that, so the suite
+# passed green with a broken import in a runner — the Monday run would simply
+# die on the first line of the job. These tests run each entry point in a FRESH
+# interpreter, from the repo root, with no path help, exactly as Actions does.
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ENTRY_POINTS = ("run_weekly_pull.py", "run_daily_pull.py", "run_push_approved.py")
+
+
+def _import_in_subprocess(target: str, extra_env: dict | None = None):
+    """Import `target` in a clean interpreter without executing its main().
+
+    Loading it under a module name other than "__main__" runs every top-level
+    import while leaving the `if __name__ == "__main__"` block alone — so this
+    proves the imports resolve without running the pipeline or touching a
+    network. Deliberately no conftest.py and no PYTHONPATH: if production
+    needs a path fixup, production has to be the thing that provides it.
+    """
+    import os
+    import subprocess
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('entry_under_test', {target!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "assert callable(mod.main), 'entry point exposes no main()'\n"
+        "print('IMPORT_OK')\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env.update(extra_env or {})
+    return subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
+                          capture_output=True, text=True, env=env, timeout=120)
+
+
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_entry_point_imports_cleanly(entry):
+    """A broken import in a runner must fail the suite, not just Monday."""
+    result = _import_in_subprocess(entry)
+    assert result.returncode == 0, (
+        f"{entry} does not import as the workflow runs it:\n{result.stderr}")
+    assert "IMPORT_OK" in result.stdout
+
+
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_entry_point_imports_without_any_secrets(entry):
+    """Every secret is optional-by-design; import must not depend on one.
+
+    Import-time work (config module constants, int() on SMTP_PORT, provider
+    construction) is where a missing or empty secret turns into a crash before
+    a single log line is written.
+    """
+    blank = {k: "" for k in (
+        "ANTHROPIC_API_KEY", "FUB_API_KEY", "BATCHDATA_API_KEY", "HEALTHCHECK_URL",
+        "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "EMAIL_FROM",
+        "MAX_SKIP_TRACES_PER_RUN", "RUN_MODE", "DRY_RUN", "LLM_MODEL")}
+    result = _import_in_subprocess(entry, blank)
+    assert result.returncode == 0, (
+        f"{entry} fails to import with all secrets empty — GitHub Actions sets "
+        f"unset secrets to the empty string:\n{result.stderr}")
+
+
+def test_every_package_module_imports():
+    """Catches a module no test happens to import (a new source, a helper).
+
+    Without this, adding a file with a syntax error or a bad import can sit
+    green until the run that first needs it.
+    """
+    import subprocess
+    pkg = REPO_ROOT / "src" / "seller_finder"
+    modules = sorted(
+        ".".join(p.relative_to(REPO_ROOT / "src").with_suffix("").parts)
+        for p in pkg.rglob("*.py") if p.name != "__init__.py")
+    assert len(modules) >= 12, f"expected the full package, found {modules}"
+    code = "import importlib\n" + "".join(
+        f"importlib.import_module({m!r})\n" for m in modules) + "print('ALL_OK')\n"
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=REPO_ROOT / "src",
+        capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"package import failed:\n{result.stderr}"
+
+
+def test_workflows_invoke_the_entry_points_that_exist():
+    """Guard against renaming a runner and leaving the workflow pointing at
+    the old name — the failure would only appear on the next cron fire."""
+    import re
+    wf_dir = REPO_ROOT / ".github" / "workflows"
+    referenced = set()
+    for wf in wf_dir.glob("*.yml"):
+        referenced |= set(re.findall(r"python3?\s+(run_[a-z_]+\.py)", wf.read_text()))
+    assert referenced, "no workflow invokes a runner — did the run: steps change?"
+    for script in referenced:
+        assert (REPO_ROOT / script).exists(), (
+            f"a workflow runs {script}, which does not exist in the repo")
 
 
 # ── Audit regressions (2026-07) ──────────────────────────────────────────
@@ -1736,12 +1979,12 @@ def test_push_approved_does_not_reset_the_dead_mans_switch(monkeypatch):
     assert "collect_stage_errors" in src and "return 1" in src
 
 
-def test_mirror_asset_key_cleared_when_download_fails(monkeypatch, tmp_path):
+def test_mirror_asset_key_cleared_when_download_fails(monkeypatch, tmp_path, clean_asset_key):
     """A stale key would let a daily run skip owner-change bookkeeping against
     data that actually came from the TxGIO fallback."""
     from seller_finder.sources import parcels
 
-    parcels._LAST_ASSET_KEY["bexar"] = "999:888"
+    clean_asset_key["bexar"] = "999:888"
     monkeypatch.setattr(parcels, "_github_token", lambda: "")
     assert parcels._download_from_mirror("bexar", tmp_path / "x.zip") is False
     assert "bexar" not in parcels._LAST_ASSET_KEY
