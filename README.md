@@ -55,12 +55,14 @@ State is split across two SQLite files (GitHub rejects committed files over 100 
 
 | File | Contents | Lifecycle |
 |---|---|---|
-| `data/seller_finder.sqlite3` | Leads (qualified only), skip-trace cache, run history, divorce cases, deed dates, plus compact derived attributes: `owners_first_seen` (tenure baseline + owner-change detection for absentee parcels) and `exempt_parcels` (homestead diff snapshot) | AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern as LDR-Automation-Clean. Stays ~10 MB for two counties, well under 100 MB even at 5+ counties. A size guard fails the run loudly if it ever approaches the limit |
+| `data/seller_finder.sqlite3` | Leads (qualified only), skip-trace cache, run history, divorce cases, deed dates, plus compact derived attributes: `owners_first_seen` (tenure baseline + owner-change detection for absentee parcels) and `exempt_parcels` (homestead diff snapshot) | AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern as LDR-Automation-Clean. Stays ~10 MB for two counties, well under 100 MB even at 5+ counties. A size guard runs in two places: `state.check_state_size()` fails the run at 90 MB, and the state-sync action **refuses to commit** an encrypted DB over 95 MB — the push step is `if: always()`, so the in-process guard alone could not stop a run that crashed before reaching it |
 | `data/parcels_cache.sqlite3` | The full raw parcel snapshot (`pc.parcels`) | **Ephemeral and gitignored** — rebuilt from the release mirror download on every weekly run and ATTACHed to the main connection, so cross-table joins work transparently. Never committed |
 
 Sub-threshold candidates (e.g. absentee-only at 30 points) are recomputed from the parcel cache each run and are *not* stored — only qualified leads (40+) persist. Opening a pre-split state DB triggers an automatic one-time migration that salvages the compact attributes, drops the heavy parcels table, and VACUUMs.
 
-Every run's job summary ends with a **Pipeline diagnostics** table (parcel rows/kept/absentee per county, foreclosure notices fetched/matched, scoring funnel, skip-trace and push outcomes) so a silent failure in any stage — like a blocked download producing 0 rows — is visible at a glance.
+Every run's job summary **opens with a health verdict** — either `✅ All pipeline stages healthy` or a list of the stages that failed — followed by a **Pipeline diagnostics** table (parcel rows/kept/absentee per county, foreclosure notices fetched/matched, scoring funnel, skip-trace and push outcomes).
+
+The verdict is not cosmetic: it drives the exit code and the healthchecks.io ping. Because every stage is wrapped in `try/except` so one bad county cannot kill a run, the process would otherwise exit 0 after a total failure. `health.collect_stage_errors()` catches both recorded exceptions **and** silent failures that raise nothing — every skip-trace erroring (revoked token / empty PayGo wallet), every FUB push failing, a parcel sync keeping zero rows, a truncated exemption feed, an unreadable inbox CSV. Any of those fails the run and pings `/fail`.
 
 ---
 
@@ -195,11 +197,12 @@ LDR-Seller-Finder/
 ├── config/settings.yaml          # Scoring weights, county sources, budgets — edit freely
 ├── src/seller_finder/
 │   ├── config.py                 # Env secrets + settings loader
+│   ├── arcgis.py                 # Shared ArcGIS client (200-with-error-body guard)
 │   ├── state.py                  # Split-DB SQLite schema, legacy migration, size guard
 │   ├── scoring.py                # 0–100 scoring engine
 │   ├── fub.py                    # Follow Up Boss push: dedupe, tags, notes
 │   ├── review.py                 # Review CSV, run summary, weekly digest email
-│   ├── health.py                 # healthchecks.io dead-man's switch
+│   ├── health.py                 # Dead-man's switch + run health verdict
 │   ├── sources/
 │   │   ├── parcels.py            # TxGIO bulk parcel loader (mirror-first, light sync on daily)
 │   │   ├── exemptions.py         # Bexar homestead exemptions + removal detection
@@ -212,14 +215,14 @@ LDR-Seller-Finder/
 │       └── tracer.py             # Cache-aware, budget-capped orchestration
 ├── scripts/
 │   ├── import_deed_dates.py      # One-off deed-date import (or use data/inbox/)
-│   ├── refresh_parcel_mirror.sh  # Quarterly parcel-mirror refresh (run from home network)
+│   ├── refresh_parcel_mirror.sh  # Quarterly parcel-mirror refresh (run from home network;
+│   │                             #   POSIX sh-compatible, works on macOS bash 3.2)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 48 unit tests
-├── workflows-pending/            # New/updated workflow files (see install note below)
+├── tests/test_pipeline.py        # 115 unit tests
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron (full)
-    ├── workflows/daily-pull.yml      # Tue–Sat 6 AM CT cron (fast) — install from workflows-pending/
+    ├── workflows/daily-pull.yml      # Tue–Sat 6 AM CT cron (fast)
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
     └── actions/state-sync/action.yml # Encrypted SQLite ⇄ `state` branch
 ```
@@ -236,7 +239,7 @@ LDR-Seller-Finder/
 
 Both cron workflows share the `ldr-seller-state` concurrency group, so a long weekly run can never race a daily run on the state DB.
 
-> **Installing/updating workflow files:** the automation token cannot write `.github/workflows/`, so new or changed workflow files land in `workflows-pending/`. To install: open the file in `workflows-pending/` on GitHub → Raw → copy → create the same filename under `.github/workflows/` via **Add file → Create new file** → commit. (Or run `bash scripts/install_workflows.sh` from a local clone.)
+> **Editing workflow files:** all three workflows are live in `.github/workflows/`. A token without the `workflows` permission cannot push changes to them — if `git push` is rejected for that reason, edit the file through the GitHub web UI, or push with a PAT that carries the `workflow` scope. (The old workflows-pending staging directory and its install_workflows.sh helper were removed: the workflows have been installed since `2bf5f1d`, and running that installer would have copied the stale staged copies back over the live ones.)
 
 > **DST note:** GitHub cron is UTC-only. `0 11` = 6:00 AM CDT (summer). When daylight saving ends in November, change to `0 12` to stay at 6:00 AM CST.
 
@@ -274,8 +277,16 @@ The provider distinguishes **API errors** from **genuine no-matches** — they a
 | **Matched** (contact info returned) | Forever — already paid for | `traced` → pushed/held | Uses cache |
 | **No-match** (API succeeded, no data found) | Yes, but expires after `no_match_retrace_days` (90) | `held_no_contact` | Re-traced after expiry as provider data improves |
 | **API error** (401/402/403/422/429/5xx, network) | **Never** | stays `qualified` | Retried automatically |
+| **HTTP 200 with a failure in the body** (`status.code >= 400`, or `errorCount` covering the whole chunk) | **Never** | stays `qualified` | Retried automatically |
+| **Address-alignment failure** (provider reports `matchCount` higher than the results we can map back to our requests) | **Never** | stays `qualified` | Retried automatically |
 
 Every request logs the raw HTTP status and response body to the Actions log (the API key is never logged), and 429/5xx responses are retried with exponential backoff. The run-summary diagnostics table shows the matched / no-match / error breakdown with the top error message, so a failing token is visible at a glance instead of masquerading as "0% match rate."
+
+**Why the last two rows exist.** This repo has shipped the "a failed lookup got recorded as a successful negative" bug twice, so the rule is now enforced at every network boundary rather than trusted per call site:
+
+- *Body-level errors.* BatchData can return HTTP 200 while reporting the real status inside the body. Without the check, the chunk fell through to the no-match path and was cached — the same shape as the original 403-became-64-no-matches incident, one layer down.
+- *Address alignment.* Provider results are mapped back to our requests by normalized street + ZIP. When BatchData normalizes differently (`123 Main Street` vs our `123 MAIN ST`) the lookup misses, and a **paid** match was written out as a genuine no-match: money spent, contact info discarded, and the no-match cache then blocked a re-trace for 90 days. `meta.matchCount` is the ground truth we check against.
+- *The same rule applies to the free feeds.* ArcGIS Server (Bexar foreclosures **and** Bexar exemptions) does not use HTTP status codes for query failures — a bad field, a rebuilt layer, or a server exception all come back as HTTP 200 with `{"error": {...}}`. `raise_for_status()` passes and `data["features"]` is absent, so a broken feed read as "no foreclosure notices this month" and a broken exemption layer read as "nobody has a homestead" — the latter feeding straight into homestead-removed detection, which is worth +10, exactly enough to lift an absentee lead over the 40 trace threshold. Every ArcGIS call now goes through `arcgis.query()`, which raises on body-level errors; a genuinely empty page still means zero.
 
 > **BatchData 403 Forbidden?** Per BatchData's own troubleshooting guide, this means the API token lacks the **Property Skip Trace** endpoint permission or the PayGo wallet is empty. Fix: BatchData dashboard → **API Tokens** (key icon) → your token → **View/Update** → check the *Property Skip Trace* permission, and confirm your wallet has balance. Erred leads re-trace automatically on the next run — no manual cleanup needed.
 
@@ -349,9 +360,9 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 - **Public records only.** Every automated source is a government-published dataset or service: TxGIO StratMap (CC0), Bexar County ArcGIS services, and County Clerk foreclosure postings (Texas Property Code §51.002 requires public posting). No Zillow, Realtor.com, or other ToS-violating scraping — the county-first approach exists precisely to avoid that.
 - **No automated outreach from this repo.** It writes to FUB (tags + notes) and emails *you* a digest. Contacting leads happens in LDR-Automation-Clean under its CAN-SPAM/unsubscribe rules.
-- **Human in the loop.** Nothing reaches FUB without you triggering the push workflow after reviewing the CSV.
+- **Automated push, reviewable after the fact.** Qualified, contactable leads are **auto-pushed to FUB at the end of every run** — there is no approval gate in front of it (that gate was removed in commit `fed9e8f`). What you get instead is a complete record: the `pending-leads` artifact lists every lead pushed, held, or awaiting retry, and the Monday digest carries the same counts. Use the **Push Approved Leads** workflow's `exclude_ids` input to suppress specific leads on a retry. If you want a true human gate, unset `FUB_API_KEY` on the cron workflows — leads then accumulate in `awaiting_approval` and only the manual workflow pushes them.
 - **TCPA awareness.** DNC and litigator flags from skip tracing are stored and surfaced in the review CSV. If you cold-call, scrub against the federal DNC registry; TCPA-restricted numbers are excluded by the provider by default.
-- **Privacy.** Owner data stays inside the encrypted state DB on the private `state` branch; the review CSV lives only in 30-day Actions artifacts.
+- **Privacy / data minimisation.** Owner data stays inside the AES-256 encrypted state DB on the `state` branch. The review CSV — which does contain owner names, property addresses, emails and phones — lives only in Actions artifacts, retained **30 days (weekly) / 14 days (daily)**, then deleted by GitHub. The skip-trace cache stores only what the pipeline uses (emails, phones, DNC/litigator flags) plus a non-identifying provenance stub; the provider's full consumer profile (relatives, address history, DOB) is **never stored** — see migration v5. Secrets are never logged: failures log HTTP status and response body, never the key.
 
 ---
 
@@ -359,7 +370,9 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ```bash
 pip install -r requirements.txt pytest
-python3 -m pytest tests/ -v          # 48 unit tests (scoring, warm tier, budgets, dedupe, matching, migration, error handling)
+python3 -m pytest tests/ -v          # 115 unit tests (scoring, warm tier, budgets, dedupe,
+                                     # idempotency, migrations, feed/API error discipline,
+                                     # PII minimisation, entry-point imports)
 DRY_RUN=true python3 scripts/e2e_live_test.py   # live smoke test, zero spend
 ```
 

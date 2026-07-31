@@ -1592,6 +1592,51 @@ def test_every_package_module_imports():
     assert result.returncode == 0, f"package import failed:\n{result.stderr}"
 
 
+def test_readme_test_count_is_accurate(request):
+    """The README claimed 48 tests while 67 existed — a small lie, but the kind
+    that tells you nobody re-reads the docs when they change the code."""
+    import re
+    claimed = set(re.findall(r"(\d+) unit tests", (REPO_ROOT / "README.md").read_text()))
+    assert claimed, "README no longer states a test count"
+    actual = request.session.testscollected or len(request.session.items)
+    for c in claimed:
+        assert int(c) == actual, (
+            f"README says {c} unit tests; the suite collects {actual}")
+
+
+def test_readme_documents_every_settings_key():
+    """settings.yaml is the tuning surface Peter is told to edit freely. A key
+    that exists but is undocumented is a knob nobody knows they have."""
+    import yaml
+    readme = (REPO_ROOT / "README.md").read_text()
+    settings = yaml.safe_load((REPO_ROOT / "config" / "settings.yaml").read_text())
+    undocumented = [k for k in settings if k not in readme]
+    assert not undocumented, f"settings.yaml keys missing from README: {undocumented}"
+
+
+def test_readme_does_not_promise_a_manual_approval_gate():
+    """Auto-push replaced the approval gate in fed9e8f, but the Compliance
+    section still promised 'nothing reaches FUB without you triggering the push
+    workflow'. Wrong docs about an automated outbound write are worse than none.
+    """
+    readme = (REPO_ROOT / "README.md").read_text()
+    assert "Nothing reaches FUB without you triggering" not in readme
+    # And the code really does push without a gate, so the docs must say so.
+    weekly = (REPO_ROOT / "run_weekly_pull.py").read_text()
+    assert "auto_push_leads" in weekly
+    assert "auto-pushed to FUB" in readme or "auto-pushed" in readme
+
+
+def test_referenced_paths_in_readme_exist():
+    """Catches the workflows-pending/install_workflows class of drift: docs
+    pointing at files that were deleted or never existed."""
+    import re
+    readme = (REPO_ROOT / "README.md").read_text()
+    referenced = set(re.findall(r"`((?:src/|scripts/|config/|tests/|\.github/)[\w./-]+)`", readme))
+    missing = sorted(p for p in referenced if not (REPO_ROOT / p).exists())
+    assert not missing, f"README references paths that do not exist: {missing}"
+
+
 def test_workflows_invoke_the_entry_points_that_exist():
     """Guard against renaming a runner and leaving the workflow pointing at
     the old name — the failure would only appear on the next cron fire."""
