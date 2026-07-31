@@ -92,6 +92,29 @@ class BatchDataProvider(SkipTraceProvider):
             key = self._addr_key(addr.get("street", ""), addr.get("zip", ""))
             by_addr.setdefault(key, p)
 
+        # Alignment guard. We map the provider's persons back onto our requests
+        # by normalized street+zip. If BatchData normalizes an address
+        # differently than we do ("123 Main Street" vs our "123 MAIN ST"), the
+        # lookup misses and a PAID match is written to the cache as a
+        # no-match — money spent, contact info discarded, and the no-match
+        # cache then blocks a re-trace for no_match_retrace_days. The provider
+        # tells us how many it matched; if we aligned fewer, the mismatch is
+        # ours, so report the unaligned ones as ERRORS (never cached, retried
+        # next run) rather than silently inventing negatives.
+        claimed = _int_or_none(counts.get("matchCount"))
+        aligned = sum(
+            1 for r in chunk
+            if (by_addr.get(self._addr_key(r.street, r.zip)) or {}).get("meta", {}).get("matched"))
+        if claimed is not None and aligned < claimed:
+            err = (f"address alignment failure: provider reported matchCount="
+                   f"{claimed} but only {aligned} of {len(chunk)} results could "
+                   f"be matched back to the requested addresses — treating as "
+                   f"an error so paid matches are not cached as no-matches")
+            LOGGER.error("BatchData %s. Sample provider address(es): %s", err,
+                         [(p.get("propertyAddress", {}) or {}).get("street")
+                          for p in persons[:3]])
+            return [SkipTraceResult(provider=self.name, error=err) for _ in chunk]
+
         out = []
         for r in chunk:
             p = by_addr.get(self._addr_key(r.street, r.zip))
@@ -196,3 +219,17 @@ class BatchDataProvider(SkipTraceProvider):
     @staticmethod
     def _addr_key(street: str, zip_code: str) -> str:
         return f"{' '.join((street or '').upper().split())}|{(zip_code or '')[:5]}"
+
+
+def _int_or_none(value) -> int | None:
+    """Coerce a provider-supplied count to int; None when absent/unparseable.
+
+    None means "the provider did not tell us", which must not be read as zero —
+    the alignment guard only fires when there is a real number to compare to.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

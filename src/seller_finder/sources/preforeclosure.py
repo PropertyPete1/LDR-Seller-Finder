@@ -26,15 +26,13 @@ notices right now" and must never be produced by a network failure.
 import csv
 import logging
 
-import requests
-
 from .. import config
+from ..arcgis import ArcGISError
+from ..arcgis import query as arcgis_query
 from ..state import already_ingested, mark_ingested
 from ..sources.parcels import normalize_addr
 
 LOGGER = logging.getLogger("sources.preforeclosure")
-
-UA = {"User-Agent": "LDR-Seller-Finder/1.0 (public records research)"}
 
 
 class FeedUnavailable(RuntimeError):
@@ -76,10 +74,11 @@ def fetch(county: str, conn=None) -> list[dict]:
             "f": "json",
         }
         try:
-            resp = requests.get(url, params=params, headers=UA, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001
+            # arcgis_query raises on transport errors AND on the HTTP-200
+            # bodies ArcGIS uses to report query failures — see arcgis.py.
+            # Without that check a broken layer reads as "no notices".
+            data = arcgis_query(None, url, params, timeout=120, attempts=3)
+        except ArcGISError as exc:
             LOGGER.error("Foreclosure fetch failed (%s %s): %s", county, kind, exc)
             failed += 1
             continue

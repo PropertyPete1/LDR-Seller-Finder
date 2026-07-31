@@ -816,8 +816,29 @@ def test_foreclosure_inbox_csvs_are_not_gitignored():
         f"reach the Actions runner. Matched rule: {out.stdout.strip()}")
 
 
-def test_live_feed_failure_is_an_error_not_zero_notices(monkeypatch):
+class _OkFeedResp:
+    """One ArcGIS page carrying a single mortgage/tax notice."""
+    status_code = 200
+    @staticmethod
+    def raise_for_status():
+        return None
+    @staticmethod
+    def json():
+        return {"features": [{"attributes": {
+            "ADDRESS": "1 MAIN ST", "DOC_NUMBER": "D1", "YEAR": 2026,
+            "MONTH": 8, "CITY": "SAN ANTONIO", "ZIP": "78201"}}]}
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Skip the ArcGIS retry sleeps so feed tests stay fast."""
+    from seller_finder import arcgis
+    monkeypatch.setattr(arcgis.time, "sleep", lambda s: None)
+
+
+def test_live_feed_failure_is_an_error_not_zero_notices(monkeypatch, no_backoff):
     """A blocked foreclosure feed must raise, never look like a quiet month."""
+    from seller_finder import arcgis
     from seller_finder.sources import preforeclosure
 
     monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
@@ -826,41 +847,157 @@ def test_live_feed_failure_is_an_error_not_zero_notices(monkeypatch):
 
     def boom(*a, **k):
         raise OSError("connection reset")
-    monkeypatch.setattr(preforeclosure.requests, "get", boom)
+    monkeypatch.setattr(arcgis.requests, "get", boom)
 
     with pytest.raises(preforeclosure.FeedUnavailable):
         preforeclosure.fetch("bexar")
 
 
-def test_partial_feed_failure_still_returns_the_good_half(monkeypatch):
+def test_partial_feed_failure_still_returns_the_good_half(monkeypatch, no_backoff):
     """One of two feeds failing is degraded, not fatal — keep what we got."""
+    from seller_finder import arcgis
     from seller_finder.sources import preforeclosure
 
     monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
                         {"bexar": {"mortgage_url": "https://example.invalid/m",
                                    "tax_url": "https://example.invalid/t"}})
 
-    class OkResp:
+    def flaky(url, **k):
+        # The mortgage layer is down for good — every retry fails. The tax
+        # layer answers normally.
+        if url.endswith("/m"):
+            raise OSError("mortgage feed down")
+        return _OkFeedResp()
+    monkeypatch.setattr(arcgis.requests, "get", flaky)
+
+    notices = preforeclosure.fetch("bexar")
+    assert len(notices) == 1 and notices[0]["kind"] == "tax"
+
+
+def test_transient_feed_error_is_retried_then_succeeds(monkeypatch, no_backoff):
+    """A one-off blip must not cost us the county's notices for the day."""
+    from seller_finder import arcgis
+    from seller_finder.sources import preforeclosure
+
+    monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
+                        {"bexar": {"mortgage_url": "https://example.invalid/m"}})
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient reset")
+        return _OkFeedResp()
+    monkeypatch.setattr(arcgis.requests, "get", flaky)
+
+    notices = preforeclosure.fetch("bexar")
+    assert len(notices) == 1 and calls["n"] == 2
+
+
+def test_arcgis_200_with_error_body_is_a_failure_not_zero_notices(monkeypatch, no_backoff):
+    """ArcGIS reports query failures as HTTP 200 + {"error": ...}.
+
+    raise_for_status() passes and data["features"] is absent, so the old code
+    read a broken layer as 'no foreclosures this month' and the run went green.
+    Same defect class as the BatchData 403-became-64-no-matches incident.
+    """
+    from seller_finder import arcgis
+    from seller_finder.sources import preforeclosure
+
+    monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
+                        {"bexar": {"mortgage_url": "https://example.invalid/m",
+                                   "tax_url": "https://example.invalid/t"}})
+
+    class ArcErr:
         status_code = 200
         @staticmethod
         def raise_for_status():
             return None
         @staticmethod
         def json():
-            return {"features": [{"attributes": {
-                "ADDRESS": "1 MAIN ST", "DOC_NUMBER": "D1", "YEAR": 2026,
-                "MONTH": 8, "CITY": "SAN ANTONIO", "ZIP": "78201"}}]}
+            return {"error": {"code": 400, "message": "Unable to complete operation",
+                              "details": ["Invalid field: ADDRESS"]}}
+    monkeypatch.setattr(arcgis.requests, "get", lambda *a, **k: ArcErr())
+
+    with pytest.raises(preforeclosure.FeedUnavailable):
+        preforeclosure.fetch("bexar")
+
+
+def test_arcgis_body_error_is_not_retried(monkeypatch, no_backoff):
+    """A malformed query fails identically every time — don't burn 3 attempts."""
+    from seller_finder import arcgis
 
     calls = {"n": 0}
-    def flaky(*a, **k):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise OSError("mortgage feed down")
-        return OkResp()
-    monkeypatch.setattr(preforeclosure.requests, "get", flaky)
 
-    notices = preforeclosure.fetch("bexar")
-    assert len(notices) == 1 and notices[0]["kind"] == "tax"
+    class ArcErr:
+        status_code = 200
+        @staticmethod
+        def raise_for_status():
+            return None
+        @staticmethod
+        def json():
+            return {"error": {"code": 400, "message": "Invalid field"}}
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return ArcErr()
+    monkeypatch.setattr(arcgis.requests, "get", counting)
+
+    with pytest.raises(arcgis.ArcGISError, match="Invalid field"):
+        arcgis.query(None, "https://example.invalid/q", {}, attempts=3)
+    assert calls["n"] == 1
+
+
+def test_arcgis_empty_result_is_still_a_valid_zero(monkeypatch, no_backoff):
+    """Guard against over-correction: a healthy empty page must stay empty,
+    not become an error — some months genuinely have no notices."""
+    from seller_finder import arcgis
+    from seller_finder.sources import preforeclosure
+
+    monkeypatch.setitem(config.SETTINGS, "foreclosure_sources",
+                        {"bexar": {"mortgage_url": "https://example.invalid/m"}})
+
+    class Empty:
+        status_code = 200
+        @staticmethod
+        def raise_for_status():
+            return None
+        @staticmethod
+        def json():
+            return {"features": []}
+    monkeypatch.setattr(arcgis.requests, "get", lambda *a, **k: Empty())
+
+    assert preforeclosure.fetch("bexar") == []
+
+
+def test_exemption_arcgis_error_raises_instead_of_emptying_snapshot(db, monkeypatch, no_backoff):
+    """An ArcGIS error body must not end the paging loop as a clean zero.
+
+    An empty pull is diffed against the previous snapshot, which is exactly the
+    mass-homestead-removed scenario the truncation guard exists to prevent —
+    and +10 is enough to lift an absentee lead to the 40 trace threshold.
+    """
+    from seller_finder import arcgis
+    from seller_finder.sources import exemptions
+
+    monkeypatch.setitem(config.SETTINGS, "exemption_sources",
+                        {"bexar": {"url": "https://example.invalid/q"}})
+
+    class ArcErr:
+        status_code = 200
+        @staticmethod
+        def raise_for_status():
+            return None
+        @staticmethod
+        def json():
+            return {"error": {"code": 500, "message": "Layer not found"}}
+    monkeypatch.setattr(arcgis.requests, "Session",
+                        lambda: type("S", (), {"get": staticmethod(lambda *a, **k: ArcErr())})())
+    monkeypatch.setattr(exemptions.requests, "Session",
+                        lambda: type("S", (), {"get": staticmethod(lambda *a, **k: ArcErr())})())
+
+    with pytest.raises(arcgis.ArcGISError, match="Layer not found"):
+        exemptions.sync_county(db, "bexar")
 
 
 # ── Light sync (daily runs) ──────────────────────────────────────────────
@@ -943,6 +1080,206 @@ def test_batchdata_genuine_no_match_is_still_cacheable(monkeypatch):
     p = batchdata.BatchDataProvider(api_key="k")
     out = p.trace_batch([SkipTraceRequest(street="1 A ST", city="SA", state="TX", zip="78201")])
     assert out[0].error is None and out[0].matched is False
+
+
+def test_batchdata_unaligned_matches_are_errors_not_no_matches(monkeypatch):
+    """A PAID match we can't map back to our request must never be cached.
+
+    We index the provider's persons by normalized street+zip. If BatchData
+    normalizes differently ("123 Main Street" vs our "123 MAIN ST") the lookup
+    misses, and the old code wrote the result out as a genuine no-match: money
+    spent, contact info discarded, and the no-match cache then blocked a
+    re-trace for no_match_retrace_days (90). meta.matchCount is the tell.
+    """
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R200:
+        status_code = 200
+        text = "{}"
+        @staticmethod
+        def json():
+            return {"status": {"code": 200}, "results": {
+                "persons": [
+                    {"propertyAddress": {"street": "123 Main Street", "zip": "78201"},
+                     "meta": {"matched": True}, "emails": [{"email": "a@b.com"}]},
+                    {"propertyAddress": {"street": "456 Oak Avenue", "zip": "78209"},
+                     "meta": {"matched": True}, "emails": [{"email": "c@d.com"}]}],
+                "meta": {"results": {"requestCount": 2, "matchCount": 2,
+                                     "noMatchCount": 0, "errorCount": 0}}}}
+
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: R200())
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([
+        SkipTraceRequest(street="123 MAIN ST", city="SA", state="TX", zip="78201"),
+        SkipTraceRequest(street="456 OAK AVE", city="SA", state="TX", zip="78209")])
+    assert all(r.error and "alignment" in r.error for r in out)
+    assert not any(r.matched for r in out)
+
+
+def test_batchdata_aligned_matches_pass_through(monkeypatch):
+    """Guard against over-correction: when the keys line up, matches survive."""
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R200:
+        status_code = 200
+        text = "{}"
+        @staticmethod
+        def json():
+            return {"status": {"code": 200}, "results": {
+                "persons": [{"propertyAddress": {"street": "123 MAIN ST", "zip": "78201"},
+                             "meta": {"matched": True},
+                             "emails": [{"email": "a@b.com"}],
+                             "phones": []}],
+                "meta": {"results": {"requestCount": 1, "matchCount": 1,
+                                     "noMatchCount": 0, "errorCount": 0}}}}
+
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: R200())
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([SkipTraceRequest(street="123 MAIN ST", city="SA",
+                                          state="TX", zip="78201")])
+    assert out[0].error is None and out[0].matched is True
+    assert out[0].emails == ["a@b.com"]
+
+
+def test_batchdata_partial_match_response_still_aligns(monkeypatch):
+    """1 match + 1 genuine no-match in one chunk is normal and must pass."""
+    from seller_finder.skiptrace import batchdata
+    from seller_finder.skiptrace.base import SkipTraceRequest
+
+    class R200:
+        status_code = 200
+        text = "{}"
+        @staticmethod
+        def json():
+            return {"status": {"code": 200}, "results": {
+                "persons": [{"propertyAddress": {"street": "123 MAIN ST", "zip": "78201"},
+                             "meta": {"matched": True}, "emails": [{"email": "a@b.com"}]}],
+                "meta": {"results": {"requestCount": 2, "matchCount": 1,
+                                     "noMatchCount": 1, "errorCount": 0}}}}
+
+    monkeypatch.setattr(batchdata.requests, "post", lambda *a, **k: R200())
+    p = batchdata.BatchDataProvider(api_key="k")
+    out = p.trace_batch([
+        SkipTraceRequest(street="123 MAIN ST", city="SA", state="TX", zip="78201"),
+        SkipTraceRequest(street="999 GONE RD", city="SA", state="TX", zip="78209")])
+    assert [r.error for r in out] == [None, None]
+    assert [r.matched for r in out] == [True, False]
+
+
+def test_fub_tag_update_failure_is_not_a_successful_push(db, monkeypatch):
+    """The tag PUT is the entire job on the existing-person path.
+
+    Its response used to be discarded, so a 4xx/5xx marked the lead 'pushed'
+    while the DNC tag never reached FUB — the nurture system would then call
+    or text a do-not-call owner with nothing in the logs to show it.
+    """
+    from seller_finder import fub
+
+    lead_id = _make_awaiting_lead(db, "7201", phones='[{"number": "2105551234"}]', dnc=1)
+    lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "generate_summary_note", lambda lead: "")
+    monkeypatch.setattr(fub, "find_existing_person", lambda *a, **k: "555")
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+        def json(self):
+            return {"tags": ["Existing"]}
+
+    class Session:
+        auth = None
+        headers = {}
+        def update(self, *a, **k):
+            return None
+        def get(self, *a, **k):
+            return Resp(200)
+        def put(self, *a, **k):
+            return Resp(500)          # applying the tags fails
+        def post(self, *a, **k):
+            return Resp(200)
+    monkeypatch.setattr(fub.requests, "Session", lambda: Session())
+
+    assert fub.push_lead(db, lead) is None, "a failed tag PUT must not report success"
+
+
+def test_fub_tag_update_success_returns_person(db, monkeypatch):
+    """Guard against over-correction: a 200 PUT still tags and returns the id."""
+    from seller_finder import fub
+
+    lead_id = _make_awaiting_lead(db, "7202", phones='[{"number": "2105551234"}]')
+    lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "generate_summary_note", lambda lead: "")
+    monkeypatch.setattr(fub, "find_existing_person", lambda *a, **k: "555")
+
+    sent = {}
+
+    class Resp:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"tags": ["Existing"]}
+
+    class Session:
+        auth = None
+        headers = {}
+        def update(self, *a, **k):
+            return None
+        def get(self, *a, **k):
+            return Resp()
+        def put(self, url, json=None, **k):
+            sent["tags"] = json["tags"]
+            return Resp()
+        def post(self, *a, **k):
+            return Resp()
+    monkeypatch.setattr(fub.requests, "Session", lambda: Session())
+
+    assert fub.push_lead(db, lead) == "555"
+    assert "Existing" in sent["tags"] and config.TAG_SELLER in sent["tags"]
+
+
+def test_dry_run_never_calls_anthropic(db, monkeypatch):
+    """`dry_run: true` is documented as zero spend. The Claude note call used
+    to sit ABOVE the DRY_RUN bail-out, billing one completion per lead."""
+    from seller_finder import fub
+
+    lead_id = _make_awaiting_lead(db, "7203", emails='["a@b.com"]')
+    lead = dict(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    monkeypatch.setattr(fub, "find_existing_person", lambda *a, **k: None)
+
+    def explode(lead):
+        raise AssertionError("DRY_RUN must not spend Anthropic tokens")
+    monkeypatch.setattr(fub, "generate_summary_note", explode)
+
+    assert fub.push_lead(db, lead) is None
+
+
+def test_push_approved_without_fub_key_is_a_reported_error(db, monkeypatch):
+    """Parity with auto_push_leads: name the missing secret once, change
+    nothing, and surface it as a stage error rather than N per-lead failures."""
+    from seller_finder import fub
+    from seller_finder.health import collect_stage_errors
+
+    _make_awaiting_lead(db, "7204", emails='["a@b.com"]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "")
+    stats = fub.push_approved_leads(db)
+    assert stats["failed"] == 0 and stats["pushed"] == 0
+    assert "FUB_API_KEY" in stats["error"]
+    assert collect_stage_errors({"fub_push": stats}) == ["fub_push"]
+    assert db.execute(
+        "SELECT status FROM leads WHERE prop_id='7204'").fetchone()["status"] == "awaiting_approval"
 
 
 def test_fub_search_failure_never_creates_a_duplicate(db, monkeypatch):

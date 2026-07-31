@@ -178,17 +178,22 @@ def push_lead(conn, lead: dict) -> str | None:
         LOGGER.error("Lead %s NOT pushed: dedupe lookup failed (%s)", lead["id"], exc)
         return None
 
+    # Bail out BEFORE the Claude note call. This used to sit after it, so a
+    # "dry run — no spend" invocation billed one Anthropic completion per
+    # qualified lead. The dedupe lookup above is a free read and is kept so a
+    # dry run still proves the dedupe path works.
+    if config.DRY_RUN:
+        LOGGER.info("[DRY-RUN] Would push lead %s (%s) existing=%s tags=%s "
+                    "(no Claude note generated)",
+                    lead["id"], lead["owner_name"], existing_id, tags)
+        return None
+
     lead["notes"] = generate_summary_note(lead)
     note_body = build_note(lead)
 
     session = requests.Session()
     session.auth = _auth()
     session.headers.update(FUB_SYSTEM_HEADERS)
-
-    if config.DRY_RUN:
-        LOGGER.info("[DRY-RUN] Would push lead %s (%s) existing=%s tags=%s",
-                    lead["id"], lead["owner_name"], existing_id, tags)
-        return None
 
     try:
         if existing_id:
@@ -197,7 +202,16 @@ def push_lead(conn, lead: dict) -> str | None:
             resp.raise_for_status()
             current_tags = resp.json().get("tags") or []
             merged = sorted(set(current_tags) | set(tags))
-            session.put(f"{FUB_BASE}/people/{existing_id}", json={"tags": merged}, timeout=60)
+            put = session.put(f"{FUB_BASE}/people/{existing_id}",
+                              json={"tags": merged}, timeout=60)
+            # The PUT result used to be discarded. Applying the tags IS the
+            # whole job on this path, and one of them is the DNC tag that
+            # tells the nurture system in LDR-Automation-Clean not to call or
+            # text this owner. A dropped 4xx/5xx here marked the lead 'pushed'
+            # with no DNC tag in FUB — a TCPA exposure that no log would show.
+            # Failing means the lead stays awaiting_approval and retries; the
+            # retry is safe because tags are merged, not appended.
+            put.raise_for_status()
             person_id = existing_id
             LOGGER.info("Lead %s matched existing FUB person %s — tagged, no duplicate created",
                         lead["id"], person_id)
@@ -290,6 +304,15 @@ def push_approved_leads(conn) -> dict:
     Also retries 'held_no_contact' leads in case contact info has since been
     cached by a re-trace."""
     stats = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0}
+    # Same guard as auto_push_leads: without a key every dedupe lookup 401s,
+    # which _search_people turns into FubSearchError, which would mark every
+    # lead 'failed' and bury the actual cause (a missing secret) in per-lead
+    # noise. Say it once, plainly, and change nothing.
+    if not config.FUB_API_KEY:
+        LOGGER.error("FUB_API_KEY not set — push SKIPPED; leads keep their "
+                     "current status. Add the secret and re-run.")
+        stats["error"] = "FUB_API_KEY not configured"
+        return stats
     leads = conn.execute(
         "SELECT * FROM leads WHERE status IN ('awaiting_approval','held_no_contact') "
         "ORDER BY score DESC"

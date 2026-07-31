@@ -9,17 +9,17 @@ Comal has no free exemption feed — the module simply skips counties without
 an `exemption_sources` entry in settings.yaml (documented in README).
 """
 import logging
-import time
 
 import requests
 
 from .. import config
+from ..arcgis import ArcGISError
+from ..arcgis import query as arcgis_query
 from ..state import now_iso
 
 LOGGER = logging.getLogger("sources.exemptions")
 
 PAGE_SIZE = 1000
-UA = {"User-Agent": "LDR-Seller-Finder/1.0 (public records research)"}
 
 
 def _has_homestead(exempts: str) -> bool:
@@ -50,17 +50,11 @@ def fetch_exemptions(county: str):
             "resultRecordCount": PAGE_SIZE,
             "f": "json",
         }
-        for attempt in range(3):
-            try:
-                resp = session.get(url, params=params, headers=UA, timeout=120)
-                resp.raise_for_status()
-                data = resp.json()
-                break
-            except Exception as exc:  # noqa: BLE001
-                if attempt == 2:
-                    raise
-                LOGGER.warning("Exemption page retry (%s): %s", offset, exc)
-                time.sleep(5 * (attempt + 1))
+        # Raises ArcGISError on transport failure AND on the HTTP-200 error
+        # bodies ArcGIS uses (see arcgis.py). Letting one of those become an
+        # empty page would end the paging loop early and feed a truncated
+        # snapshot straight into homestead-removed detection.
+        data = arcgis_query(session, url, params, timeout=120, attempts=3)
         feats = data.get("features", [])
         if not feats:
             break
