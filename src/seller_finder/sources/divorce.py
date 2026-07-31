@@ -39,7 +39,22 @@ from ..state import now_iso
 
 LOGGER = logging.getLogger("sources.divorce")
 
-INBOX_DIR = Path(config.DATA_DIR) / "inbox"
+# Matching costs one Claude call per party name. A case whose parties own no
+# property in our counties — the common case for a county-wide filing list —
+# never matches, so without a cap it is re-sent on every weekly run forever.
+# Three attempts covers the real reason to retry: a parcel refresh landing
+# between runs, or a deed/owner update changing the candidate set.
+MAX_MATCH_ATTEMPTS = 3
+
+
+def _inbox_dir() -> Path:
+    """Resolved at call time, not import time.
+
+    As a module-level constant this ignored both the DATA_DIR env override and
+    any later change to config.DATA_DIR, so this module read a different inbox
+    than deeds.py and preforeclosure.py, which both resolve per call.
+    """
+    return Path(config.DATA_DIR) / "inbox"
 
 
 def fetch(county: str) -> list[dict]:
@@ -68,9 +83,10 @@ def fetch_from_csv() -> list[dict]:
     petitioner, respondent. Extra columns are ignored.
     """
     filings = []
-    if not INBOX_DIR.exists():
+    inbox = _inbox_dir()
+    if not inbox.exists():
         return filings
-    for path in sorted(INBOX_DIR.glob("divorce_*.csv")):
+    for path in sorted(inbox.glob("divorce_*.csv")):
         try:
             with open(path, newline="", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
@@ -118,6 +134,13 @@ plausibly the same person. Be conservative: common names need corroborating
 middle initials or spouse names to score above 0.8."""
 
 
+def _anthropic_client():
+    """Build the Claude client. A named seam so tests can mock the paid
+    boundary without reaching into the `anthropic` package internals."""
+    import anthropic
+    return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+
+
 def _candidate_owners(conn, party_name: str, limit: int = 25) -> list[dict]:
     """Cheap SQL prefilter: parcels whose owner shares the party's surname."""
     tokens = [t for t in party_name.upper().replace(",", " ").split() if len(t) >= 3]
@@ -138,21 +161,42 @@ def match_filings_to_owners(conn, min_confidence: float = 0.8) -> list[dict]:
 
     Returns list of {case_number, county, prop_id, owner_name, confidence}.
     """
+    # match_attempts caps the retry budget — see MAX_MATCH_ATTEMPTS. Without
+    # it this query returned every never-matched case on every weekly run and
+    # re-billed Claude for each one indefinitely.
     unmatched = conn.execute(
-        "SELECT id, case_number, party_names FROM divorce_cases WHERE matched_prop_id IS NULL"
+        "SELECT id, case_number, party_names FROM divorce_cases "
+        "WHERE matched_prop_id IS NULL AND COALESCE(match_attempts, 0) < ? "
+        "ORDER BY id", (MAX_MATCH_ATTEMPTS,)
     ).fetchall()
     if not unmatched:
         return []
 
+    if config.DRY_RUN:
+        # A dry run is documented as zero spend; matching is a paid API call.
+        LOGGER.info("[DRY-RUN] Would attempt Claude matching for %d divorce case(s)",
+                    len(unmatched))
+        return []
+
+    if not config.ANTHROPIC_API_KEY:
+        LOGGER.warning("ANTHROPIC_API_KEY not set — divorce matching SKIPPED for "
+                       "%d case(s) (optional secret)", len(unmatched))
+        return []
+
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        client = _anthropic_client()
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Anthropic client unavailable — skipping divorce matching: %s", exc)
         return []
 
     matches = []
     for case in unmatched:
+        # Count the attempt up front: if this run dies mid-loop the case must
+        # not get a free retry on top of its budget.
+        conn.execute(
+            "UPDATE divorce_cases SET match_attempts=COALESCE(match_attempts,0)+1, "
+            "last_attempt_at=? WHERE id=?", (now_iso(), case["id"]))
+        conn.commit()
         for party in json.loads(case["party_names"]):
             candidates = _candidate_owners(conn, party)
             if not candidates:
@@ -172,10 +216,14 @@ def match_filings_to_owners(conn, min_confidence: float = 0.8) -> list[dict]:
                     }],
                 )
                 result = json.loads(resp.content[0].text.strip())
+                # Parsing the model's answer belongs INSIDE the try: a
+                # non-numeric confidence ("high") raised ValueError out of the
+                # whole function and took the entire divorce stage down.
+                mi = result.get("match_index")
+                conf = float(result.get("confidence") or 0)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("LLM match failed for %s: %s", party, exc)
                 continue
-            mi, conf = result.get("match_index"), float(result.get("confidence") or 0)
             if mi is not None and conf >= min_confidence and 0 <= mi < len(candidates):
                 hit = candidates[mi]
                 conn.execute(

@@ -88,7 +88,13 @@ CREATE TABLE IF NOT EXISTS divorce_cases (
     matched_prop_id TEXT,
     matched_county  TEXT,
     match_confidence REAL,
-    created_at      TEXT
+    created_at      TEXT,
+    -- Matching costs one Claude call per party name. Cases that never match
+    -- (party owns no property in our counties — the common case) would
+    -- otherwise be re-sent on every weekly run forever, so attempts are
+    -- capped. See divorce.MAX_MATCH_ATTEMPTS.
+    match_attempts  INTEGER DEFAULT 0,
+    last_attempt_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS deed_dates (
@@ -296,6 +302,21 @@ def _migrate_versioned(conn: sqlite3.Connection) -> None:
         LOGGER.info("Migration v3: inbox ingest ledger active (data/inbox CSVs "
                     "are now committed and de-duplicated by content hash)")
         conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+
+    if version < 4:
+        # v4 (2026-07): cap divorce match retries. Matching costs one Claude
+        # call per party name and selected `WHERE matched_prop_id IS NULL`, so
+        # a case whose parties own no property in our counties — the common
+        # case — was re-sent to the API on every weekly run, forever. Existing
+        # rows predate the columns; CREATE TABLE IF NOT EXISTS won't add them.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(divorce_cases)")}
+        if "match_attempts" not in cols:
+            conn.execute("ALTER TABLE divorce_cases ADD COLUMN match_attempts INTEGER DEFAULT 0")
+        if "last_attempt_at" not in cols:
+            conn.execute("ALTER TABLE divorce_cases ADD COLUMN last_attempt_at TEXT")
+        LOGGER.info("Migration v4: divorce match-attempt cap active")
+        conn.execute("PRAGMA user_version = 4")
         conn.commit()
 
 

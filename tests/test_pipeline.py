@@ -1000,6 +1000,127 @@ def test_exemption_arcgis_error_raises_instead_of_emptying_snapshot(db, monkeypa
         exemptions.sync_county(db, "bexar")
 
 
+# ── Divorce matching: spend control ──────────────────────────────────────
+
+def _seed_divorce_case(db, case_number="2026CI001", party="JOHN SMITH"):
+    from seller_finder.sources import divorce
+    divorce.store_filings(db, [{"case_number": case_number, "filed_date": "2026-07-01",
+                                "party_names": [party], "county": "bexar"}])
+    return case_number
+
+
+def test_divorce_match_attempts_are_capped(db, monkeypatch):
+    """A case whose parties own nothing in our counties never matches.
+
+    The query was `WHERE matched_prop_id IS NULL`, so every such case was
+    re-sent to Claude on every weekly run, forever — an unbounded recurring
+    bill that grows with every filing list ingested.
+    """
+    from seller_finder.sources import divorce
+
+    _insert_parcel(db, prop_id="AA1", owner="SMITH JOHN")
+    _seed_divorce_case(db)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-fake")
+
+    calls = {"n": 0}
+
+    class NeverMatches:
+        class messages:
+            @staticmethod
+            def create(**k):
+                calls["n"] += 1
+                return type("R", (), {"content": [type("T", (), {
+                    "text": '{"match_index": null, "confidence": 0.0}'})()]})()
+
+    monkeypatch.setattr(divorce, "_anthropic_client", lambda: NeverMatches())
+
+    for _ in range(6):  # six weekly runs
+        divorce.match_filings_to_owners(db)
+    assert calls["n"] == divorce.MAX_MATCH_ATTEMPTS, (
+        f"unmatched case was retried {calls['n']} times; cap is "
+        f"{divorce.MAX_MATCH_ATTEMPTS}")
+    row = db.execute("SELECT match_attempts FROM divorce_cases").fetchone()
+    assert row["match_attempts"] == divorce.MAX_MATCH_ATTEMPTS
+
+
+def test_divorce_match_succeeds_within_budget(db, monkeypatch):
+    """Over-correction guard: a real match still lands on the first attempt."""
+    from seller_finder.sources import divorce
+
+    _insert_parcel(db, prop_id="AA2", owner="SMITH JOHN")
+    _seed_divorce_case(db, "2026CI002")
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-fake")
+
+    class Matches:
+        class messages:
+            @staticmethod
+            def create(**k):
+                return type("R", (), {"content": [type("T", (), {
+                    "text": '{"match_index": 0, "confidence": 0.95}'})()]})()
+
+    monkeypatch.setattr(divorce, "_anthropic_client", lambda: Matches())
+    matches = divorce.match_filings_to_owners(db)
+    assert len(matches) == 1 and matches[0]["prop_id"] == "AA2"
+    # A matched case is never re-sent, regardless of the attempt counter.
+    assert divorce.match_filings_to_owners(db) == []
+
+
+def test_divorce_matching_is_skipped_in_dry_run(db, monkeypatch):
+    """`dry_run: true` is documented as zero spend; matching is a paid call."""
+    from seller_finder.sources import divorce
+
+    _insert_parcel(db, prop_id="AA3", owner="SMITH JOHN")
+    _seed_divorce_case(db, "2026CI003")
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-fake")
+
+    def explode():
+        raise AssertionError("DRY_RUN must not build an Anthropic client")
+    monkeypatch.setattr(divorce, "_anthropic_client", explode)
+
+    assert divorce.match_filings_to_owners(db) == []
+    # A dry run must not consume the retry budget either.
+    assert db.execute(
+        "SELECT COALESCE(match_attempts,0) a FROM divorce_cases").fetchone()["a"] == 0
+
+
+def test_divorce_bad_llm_confidence_does_not_kill_the_stage(db, monkeypatch):
+    """A non-numeric confidence used to raise ValueError out of the whole
+    function, taking every remaining case down with it."""
+    from seller_finder.sources import divorce
+
+    _insert_parcel(db, prop_id="AA4", owner="SMITH JOHN")
+    _seed_divorce_case(db, "2026CI004")
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-fake")
+
+    class Garbage:
+        class messages:
+            @staticmethod
+            def create(**k):
+                return type("R", (), {"content": [type("T", (), {
+                    "text": '{"match_index": 0, "confidence": "high"}'})()]})()
+
+    monkeypatch.setattr(divorce, "_anthropic_client", lambda: Garbage())
+    assert divorce.match_filings_to_owners(db) == []  # no exception
+
+
+def test_divorce_inbox_dir_follows_data_dir(tmp_path, monkeypatch):
+    """INBOX_DIR was a module-level constant, so this module read a different
+    inbox than deeds.py and preforeclosure.py whenever DATA_DIR was set."""
+    from seller_finder.sources import divorce
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "divorce_2026-07-01.csv").write_text(
+        "case_number,filed_date,petitioner,respondent\n"
+        "2026CI999,2026-07-01,Jane Doe,John Doe\n")
+    filings = divorce.fetch_from_csv()
+    assert len(filings) == 1 and filings[0]["case_number"] == "2026CI999"
+
+
 # ── Light sync (daily runs) ──────────────────────────────────────────────
 
 def test_parcel_snapshot_meta_written(db):
