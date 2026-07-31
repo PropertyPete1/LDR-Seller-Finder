@@ -1345,6 +1345,168 @@ def test_light_sync_still_rebuilds_the_parcel_cache(db, monkeypatch, clean_asset
         "SELECT COUNT(*) c FROM pc.parcels WHERE county='bexar'").fetchone()["c"] == 3
 
 
+# ── Idempotency: the property that keeps this from double-billing ────────
+# The pipeline runs 6x/week against overlapping data (Monday full + Tue-Sat
+# fast), can be re-triggered by hand on the same day, and can die mid-run with
+# the state DB already committed — the state-sync push step is `if: always()`.
+# None of that may cost a second trace or create a second FUB person.
+
+def _cycle(db, foreclosures, api, pushes, monkeypatch=None):
+    """One end-to-end run: score -> trace -> stage -> push."""
+    from seller_finder import fub
+    from seller_finder.skiptrace import tracer
+    compute_scores(db, foreclosures, [], {})
+    tracer.trace_qualified_leads(db)
+    review_stage_traced(db)
+    fub.auto_push_leads(db)
+
+
+def review_stage_traced(db):
+    from seller_finder import review
+    return review.stage_traced_leads(db)
+
+
+@pytest.fixture
+def pipeline_harness(db, monkeypatch):
+    """Counting provider + FUB stub so runs can be replayed and measured."""
+    from seller_finder import fub
+    from seller_finder.skiptrace import tracer
+    from seller_finder.skiptrace.base import SkipTraceResult
+
+    api = {"calls": 0}
+    pushes = {"n": 0}
+
+    class CountingProvider:
+        name = "count"
+        def trace_batch(self, reqs):
+            api["calls"] += len(reqs)
+            return [SkipTraceResult(matched=True, emails=["a@b.com"],
+                                    provider="count") for _ in reqs]
+
+    monkeypatch.setattr(tracer, "get_provider", lambda name="x": CountingProvider())
+    monkeypatch.setattr(fub, "push_lead",
+                        lambda conn, lead: pushes.__setitem__("n", pushes["n"] + 1)
+                        or f"fub-{lead['id']}")
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "BATCHDATA_API_KEY", "fake-key")
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake-key")
+    return db, api, pushes
+
+
+def test_repeated_runs_never_double_trace_or_double_push(pipeline_harness):
+    """Mon weekly, Tue daily (same notice still in feed), Wed daily (notice
+    rotated out), then a hand-triggered re-run on the same day."""
+    db, api, pushes = pipeline_harness
+    _insert_parcel(db, prop_id="D1", absentee=1)
+    fc = [{"county": "bexar", "prop_id": "D1", "kind": "mortgage",
+           "doc_number": "d1", "month": 8, "year": 2026}]
+
+    _cycle(db, fc, api, pushes)          # Monday weekly
+    assert (api["calls"], pushes["n"]) == (1, 1)
+
+    _cycle(db, fc, api, pushes)          # Tuesday daily, same notice
+    _cycle(db, [], api, pushes)          # Wednesday daily, notice gone
+    _cycle(db, [], api, pushes)          # manual re-run, same day
+
+    assert api["calls"] == 1, "an owner was skip-traced more than once"
+    assert pushes["n"] == 1, "a lead was pushed to FUB more than once"
+    assert db.execute("SELECT COUNT(*) c FROM skip_traces").fetchone()["c"] == 1
+    row = db.execute("SELECT status, fub_person_id FROM leads").fetchone()
+    assert row["status"] == "pushed" and row["fub_person_id"] == "fub-1"
+
+
+def test_crash_after_trace_does_not_re_bill_on_recovery(pipeline_harness):
+    """The state DB is pushed with `if: always()`, so a run that dies after
+    tracing keeps the paid result. The recovery run must reuse it and finish
+    the push, not pay again."""
+    db, api, pushes = pipeline_harness
+    from seller_finder.skiptrace import tracer
+
+    _insert_parcel(db, prop_id="D2", absentee=1)
+    compute_scores(db, [{"county": "bexar", "prop_id": "D2", "kind": "mortgage",
+                         "doc_number": "d2", "month": 8, "year": 2026}], [], {})
+    tracer.trace_qualified_leads(db)     # money spent and committed...
+    assert api["calls"] == 1
+    assert db.execute("SELECT status FROM leads").fetchone()["status"] == "traced"
+    # ...then the process dies here, before staging and pushing.
+
+    _cycle(db, [], api, pushes)          # next scheduled run recovers
+    assert api["calls"] == 1, "recovery re-billed an already-paid trace"
+    assert pushes["n"] == 1
+    assert db.execute("SELECT status FROM leads").fetchone()["status"] == "pushed"
+
+
+def test_daily_and_weekly_same_week_share_one_trace(pipeline_harness, monkeypatch):
+    """Budgets differ by run mode but the cache is shared, so a lead traced by
+    Monday's weekly run is free for the rest of the week."""
+    db, api, pushes = pipeline_harness
+    _insert_parcel(db, prop_id="D3", absentee=1)
+    fc = [{"county": "bexar", "prop_id": "D3", "kind": "mortgage",
+           "doc_number": "d3", "month": 8, "year": 2026}]
+
+    monkeypatch.setattr(config, "RUN_MODE", "weekly")
+    monkeypatch.setattr(config, "MAX_SKIP_TRACES_PER_RUN", 75)
+    _cycle(db, fc, api, pushes)
+
+    monkeypatch.setattr(config, "RUN_MODE", "daily")
+    monkeypatch.setattr(config, "MAX_SKIP_TRACES_PER_RUN", 15)
+    for _ in range(5):                   # Tue-Sat
+        _cycle(db, fc, api, pushes)
+
+    assert api["calls"] == 1 and pushes["n"] == 1
+
+
+def test_budget_deferred_lead_is_picked_up_next_run(pipeline_harness, monkeypatch):
+    """Leads that miss the budget must not be lost — they stay qualified and
+    the next run traces them, highest score first."""
+    db, api, pushes = pipeline_harness
+    for i in range(3):
+        _insert_parcel(db, prop_id=f"E{i}", owner=f"OWNER{i} TEST",
+                       situs=f"{i} ELM ST", mail=f"{i} OAK AVE")
+        compute_scores(db, [{"county": "bexar", "prop_id": f"E{i}", "kind": "mortgage",
+                             "doc_number": f"e{i}", "month": 8, "year": 2026}], [], {})
+
+    monkeypatch.setattr(config, "MAX_SKIP_TRACES_PER_RUN", 1)
+    _cycle(db, [], api, pushes)
+    assert api["calls"] == 1 and pushes["n"] == 1
+
+    monkeypatch.setattr(config, "MAX_SKIP_TRACES_PER_RUN", 5)
+    _cycle(db, [], api, pushes)
+    assert api["calls"] == 3, "budget-deferred leads were never picked up"
+    assert pushes["n"] == 3
+    assert db.execute(
+        "SELECT COUNT(*) c FROM leads WHERE status='pushed'").fetchone()["c"] == 3
+
+
+def test_all_migrations_are_rerunnable_end_to_end(tmp_path):
+    """Every migration (v2..v5) must be a no-op on reopen. Regression cover for
+    the newer ones: v4 ALTERs a table and v5 rewrites rows + VACUUMs, both of
+    which are corrupting if they run twice or inside a transaction."""
+    db_file = tmp_path / "mig.sqlite3"
+    conn = get_db(db_file, parcels_cache=tmp_path / "c0.sqlite3")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version >= 5
+    conn.execute(
+        "INSERT INTO skip_traces (owner_key, provider, matched, emails, phones, "
+        "dnc, litigator, raw, traced_at) VALUES ('PAID|78201','batchdata',1,"
+        "'[\"keep@me.com\"]','[]',0,0,'{\"provider\":\"batchdata\"}',?)", (now_iso(),))
+    from seller_finder.sources import divorce
+    divorce.store_filings(conn, [{"case_number": "RERUN1", "filed_date": "2026-07-01",
+                                  "party_names": ["JANE DOE"], "county": "bexar"}])
+    conn.commit()
+    conn.close()
+
+    for i in range(3):
+        c = get_db(db_file, parcels_cache=tmp_path / f"c{i + 1}.sqlite3")
+        assert c.execute("PRAGMA user_version").fetchone()[0] == version
+        paid = c.execute("SELECT emails, matched FROM skip_traces").fetchone()
+        assert paid["matched"] == 1 and json.loads(paid["emails"]) == ["keep@me.com"]
+        assert c.execute("SELECT COUNT(*) c FROM divorce_cases").fetchone()["c"] == 1
+        assert c.execute(
+            "SELECT COALESCE(match_attempts,0) a FROM divorce_cases").fetchone()["a"] == 0
+        c.close()
+
+
 # ── Production entry points actually import ──────────────────────────────
 # This file starts with `sys.path.insert(0, .../src)`, which is a test-harness
 # convenience the real runners do not get: they do `sys.path.insert(0, "src")`,
