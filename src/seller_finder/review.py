@@ -203,6 +203,13 @@ def _diagnostics_md(run_stats: dict | None) -> list[str]:
     fp = run_stats.get("fub_push") or {}
     if "error" in fp:
         lines.append(f"| FUB push | all | ❌ ERROR: {str(fp['error'])[:120]} |")
+    elif fp.get("skipped_no_api_key"):
+        # Say which it was. "pushed 0" alone reads as "nothing to push", and the
+        # difference is whether N leads are sitting in awaiting_approval.
+        lines.append(
+            f"| FUB push | all | ⏭️ SKIPPED — FUB_API_KEY not set; "
+            f"{fp['skipped_no_api_key']} lead(s) left in awaiting_approval "
+            f"(run the Push Approved Leads workflow once the secret exists) |")
     else:
         lines.append(
             f"| FUB push | all | pushed {fp.get('pushed', 0)}, held (no contact) "

@@ -1,9 +1,11 @@
 """Encrypted SQLite state management — split into committed + ephemeral DBs.
 
 The committed DB (data/seller_finder.sqlite3) is plain SQLite while a
-workflow is running; the state-sync composite action encrypts it
-(AES-256-CBC via openssl) before committing it to the orphan `state`
-branch — the same pattern used in LDR-Automation-Clean.
+workflow is running; state_sync.py (behind the state-sync composite
+action) encrypts it (AES-256-CBC via openssl) before committing it to the
+orphan `state` branch — the same pattern used in LDR-Automation-Clean,
+including its compare-and-swap and per-table merge (state_merge.py) so two
+overlapping runs cannot discard each other's rows.
 
 GitHub rejects files over 100 MB, so RAW PARCEL RECORDS ARE NEVER STORED
 in the committed DB. Parcels are re-downloadable from the release mirror

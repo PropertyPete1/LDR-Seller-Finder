@@ -3,14 +3,18 @@ description: "Regenerate status/*.json from the state DB and commit them straigh
 
 # Run this with `if: always()`, and BEFORE the 'Push state DB' step.
 #
-# ── ORDERING IS LOAD-BEARING ────────────────────────────────────────────────
-# state-sync's push step runs `git checkout state` and then `git rm -rf .`.
-# After it, the working tree is on the orphan state branch and
-# data/seller_finder.sqlite3 is gone. Telemetry reads that file, so it has to
-# run first. Putting this step after the state push does not produce worse
-# numbers — it produces no numbers at all.
+# ── ORDERING IS PREFERENCE NOW, NOT A CONSTRAINT ────────────────────────────
+# It used to be load-bearing: state-sync's push ran `git checkout state` and
+# `git rm -rf .`, so after it the working tree was on the orphan state branch
+# and data/seller_finder.sqlite3 was gone. Telemetry reads that file, so
+# running after the push produced no numbers at all.
 #
-# ── THIS STEP MUST LEAVE THE WORKING TREE EXACTLY AS IT FOUND IT ────────────
+# state_sync.push builds its commit with plumbing now and never touches HEAD,
+# the branch or the tree (tests/test_state_sync.py pins that). Keep this step
+# first anyway: it reads the decrypted DB, and publishing before the push keeps
+# the numbers and the state that produced them from the same moment.
+#
+# ── THIS STEP MUST STILL LEAVE THE WORKING TREE EXACTLY AS IT FOUND IT ──────
 # That is not tidiness. In the sibling repo (LDR-Automation-Clean) the first
 # version of this action wrote status/*.json into the working tree. Once the
 # first telemetry commit made status/ a TRACKED path on main, every later run
@@ -22,9 +26,9 @@ description: "Regenerate status/*.json from the state DB and commit them straigh
 # state was ever persisted; and every later run recomputed the day from a DB
 # that had never seen the work and published a confident zero.
 #
-# THIS REPO STILL HAS THAT EXACT state-sync PUSH STEP. The fix that made the
-# sibling's push stop checking out branches has not been ported here, so the
-# hazard is live, not historical.
+# That mechanism is gone from this repo's push. It is not gone from the habit:
+# a step that leaves modified tracked files behind is one `git status` away
+# from breaking whatever reads the tree next.
 #
 # So: generate into a temp directory, build the commit with plumbing against a
 # temporary index, and restore status/ on the way out. HEAD, the branch and the
@@ -137,7 +141,7 @@ runs:
         git checkout -- status/ 2>/dev/null || true
         git clean -fdq status/ 2>/dev/null || true
         if [ -n "$(git status --porcelain)" ]; then
-          echo "::warning::Working tree is not clean after publishing telemetry — the state DB push may fail:"
+          echo "::warning::Working tree is not clean after publishing telemetry (the state DB push no longer depends on a clean tree, but nothing here should have dirtied it):"
           git status --porcelain
         fi
 

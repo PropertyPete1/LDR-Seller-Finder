@@ -1,5 +1,55 @@
 name: "Sync SQLite State (Encrypted)"
-description: "Pull/push the SQLite state DB from/to the 'state' branch with AES-256 encryption (same pattern as LDR-Automation-Clean)"
+description: "Pull/push the SQLite state DB from/to the 'state' branch with AES-256 encryption, compare-and-swap and merge-on-conflict"
+
+# The protocol lives in src/seller_finder/state_sync.py, which is where its
+# docstring explains it and where tests/test_state_sync.py drives it against
+# real git repositories. This file is the wiring only.
+#
+# WHY IT IS NOT A WHOLE-FILE OVERWRITE ANY MORE
+#
+# Ported from LDR-Automation-Clean (its issue #9, PRs #10 and #11). The old push
+# encrypted whatever this job happened to hold, checked out the orphan 'state'
+# branch, and committed the file as a whole-file blob. Two hazards, both of
+# which fired over there:
+#
+#   * A job that pulled before a sibling's push and finished after it threw away
+#     everything the sibling had written — and both pushes reported success.
+#     That is what made 2026-08-11 permanent in the sibling repo.
+#   * `git checkout state` refuses over one modified tracked file, and the
+#     `|| git checkout --orphan state` fallback then dies with "a branch named
+#     'state' already exists" under `bash -e`. Two workflows failed at that step
+#     for sixteen hours; every run after it recomputed the day from a DB that
+#     had never seen the work and published a confident zero.
+#
+# Now: pull records the blob SHA the DB came from; push refuses to overwrite a
+# branch that has moved since, merging what is there into this run's file first
+# (row-level, per table — see state_merge.py) and retrying. Git's fast-forward
+# check is the compare-and-swap. There is no force push: after the last attempt
+# the step FAILS, which is the whole point — a run whose rows did not land must
+# not look like a run that succeeded.
+#
+# The push no longer checks out anything. It builds the commit with plumbing
+# against a temporary index, exactly like publish-telemetry, so HEAD, the
+# current branch and the working tree are untouched. The `Publish telemetry`
+# step therefore no longer HAS to run before this one (it still does, and
+# should: it reads the decrypted DB, and running it first keeps the published
+# numbers and the pushed state from the same moment).
+#
+# The 95 MB size guard moved into state_sync.push, ahead of the commit, for the
+# reason it was added at the push site in the first place: this step runs with
+# `if: always()`, so a run that failed state.check_state_size() — or crashed
+# before reaching it — still gets here.
+#
+# ── ONE STALE COMMENT LEFT, ON PURPOSE ──────────────────────────────────────
+# daily-pull.yml and weekly-pull.yml still say the `Publish telemetry` step
+# "MUST stay ahead of 'Push state DB': that step checks out the orphan `state`
+# branch and runs `git rm -rf .`". That is no longer true — see above — but the
+# bot that ported this change cannot write to .github/workflows/ ("refusing to
+# allow a GitHub App to create or update workflow ... without `workflows`
+# permission"), so the comment needs an edit through the web UI or a PAT with
+# the `workflow` scope. It is stale text, not a hazard: the step order it asks
+# for is still the order we want, just for a different reason.
+
 inputs:
   mode:
     description: "'pull' to fetch and decrypt state, 'push' to encrypt and commit state"
@@ -10,6 +60,12 @@ inputs:
   encryption_key:
     description: "AES-256 passphrase for encrypting/decrypting the state DB"
     required: true
+
+# WHICH FILE IT SYNCS: $DATABASE_PATH, which every workflow already exports at
+# the top and which config.DB_PATH reads too — so the sync and the pipeline
+# cannot disagree about the path. No input for it, deliberately: an input with
+# its own default would silently win over the workflow env.
+
 runs:
   using: "composite"
   steps:
@@ -17,23 +73,12 @@ runs:
       if: inputs.mode == 'pull'
       shell: bash
       env:
+        # env:, never argv — the passphrase is handed to openssl as
+        # `-pass env:STATE_KEY` so it cannot surface in a process list or a log.
         STATE_KEY: ${{ inputs.encryption_key }}
       run: |
-        git fetch origin state:state 2>/dev/null || true
-        if git show state:data/seller_finder.sqlite3.enc > /dev/null 2>&1; then
-          mkdir -p data
-          git show state:data/seller_finder.sqlite3.enc > data/seller_finder.sqlite3.enc
-          openssl enc -aes-256-cbc -pbkdf2 -d \
-            -in data/seller_finder.sqlite3.enc \
-            -out data/seller_finder.sqlite3 \
-            -pass env:STATE_KEY
-          rm -f data/seller_finder.sqlite3.enc
-          echo "✅ State DB pulled and decrypted from 'state' branch"
-          ls -la data/seller_finder.sqlite3
-        else
-          echo "⚠️ No encrypted state DB found on 'state' branch — will start fresh"
-          mkdir -p data
-        fi
+        PYTHONPATH=src python3 -m seller_finder.state_sync pull
+
     - name: Encrypt and push state to 'state' branch
       if: inputs.mode == 'push'
       shell: bash
@@ -41,41 +86,4 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         STATE_KEY: ${{ inputs.encryption_key }}
       run: |
-        if [ ! -f data/seller_finder.sqlite3 ]; then
-          echo "⚠️ No state DB to push"
-          exit 0
-        fi
-        openssl enc -aes-256-cbc -pbkdf2 \
-          -in data/seller_finder.sqlite3 \
-          -out /tmp/seller_finder.sqlite3.enc \
-          -pass env:STATE_KEY
-        ENC_BYTES=$(wc -c < /tmp/seller_finder.sqlite3.enc)
-        echo "✅ State DB encrypted ($ENC_BYTES bytes)"
-
-        # Size guard AT THE PUSH SITE. state.check_state_size() runs in the
-        # Python process, but every workflow runs this step with `if: always()`
-        # — so a run that failed the guard (or crashed before it) still reached
-        # here and pushed anyway. GitHub hard-rejects blobs over 100 MB, which
-        # would fail the push after the commit is already made and leave the
-        # state branch needing manual repair. Refuse before committing: the
-        # previous good state stays on the branch and the next run resumes
-        # from it.
-        MAX_BYTES=$((95 * 1000 * 1000))
-        if [ "$ENC_BYTES" -gt "$MAX_BYTES" ]; then
-          echo "::error::Encrypted state DB is $ENC_BYTES bytes (> $MAX_BYTES guard,"\
-               "GitHub's hard limit is 100 MB). REFUSING to push — the 'state' branch"\
-               "keeps its last good version. Investigate table growth (likely the"\
-               "warm_leads or skip_traces table) before the next run."
-          exit 1
-        fi
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git fetch origin state:state 2>/dev/null || true
-        git checkout state 2>/dev/null || git checkout --orphan state
-        git rm -rf . 2>/dev/null || true
-        mkdir -p data
-        cp /tmp/seller_finder.sqlite3.enc data/seller_finder.sqlite3.enc
-        git add data/seller_finder.sqlite3.enc
-        git commit -m "state: update encrypted SQLite DB [$(date -u +%Y-%m-%dT%H:%M:%SZ)]" --allow-empty
-        git push origin state
-        echo "✅ Encrypted state DB pushed to 'state' branch"
+        PYTHONPATH=src python3 -m seller_finder.state_sync push

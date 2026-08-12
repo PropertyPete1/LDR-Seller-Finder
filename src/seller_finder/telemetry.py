@@ -61,18 +61,26 @@ skip_traces — skiptrace.traced: NEW, billable traces. Deliberately excludes
     Under DRY_RUN the tracer sets traced = 0 on purpose, so a dry run reports
     a true, counted zero rather than the work it would have done.
 
+    A run with no BATCHDATA_API_KEY keeps its zero here too, and that is not
+    the same call as the one made for leads_pushed_fub below: this counter
+    measures SPEND, and zero traces really did cost zero. The tracer reports
+    `skipped_no_api_key` beside it (how many leads advanced without contact
+    info), which is what the diagnostics table reads.
+
 leads_pushed_fub — fub_push.pushed: leads that reached Follow Up Boss and came
     back with a person id. Under DRY_RUN this stays 0 while the run records
     `dry_run_would_push` separately, which is NOT read here — intent is not
     delivery. Same reason the nurture bot's panel refuses to count dry_run_sent.
 
-    KNOWN LIMITATION: when FUB_API_KEY is unset, auto_push_leads returns all
-    zeros and returns early, which is indistinguishable in the stats dict from
-    "there were no leads awaiting push". Both publish 0. That is a true
-    statement either way — zero leads reached FUB — but it is not the "we
-    looked and there was nothing to do" it reads like. Fixing it properly means
-    a `skipped_no_api_key` marker in fub.auto_push_leads, the way the tracer
-    already does it; until then this docstring is the disclosure.
+    A RUN THAT NEVER LOOKED PUBLISHES NO COUNTER. When FUB_API_KEY is unset,
+    auto_push_leads pushes nothing and reports `skipped_no_api_key` — the
+    number of leads left in awaiting_approval — the way the tracer already
+    reports a missing BATCHDATA_API_KEY. This used to be a disclosed gap: the
+    keyless run returned all zeros, which was indistinguishable from "there
+    were no leads awaiting push", and both published 0. Now the keyless run
+    OMITS `leads_pushed_fub` and names `fub_push` in `incomplete_stages`, which
+    is THE RULE above applied to a stage that did not run. A run that pushed
+    nothing because there was nothing to push still publishes a counted zero.
 
 ─────────────────────────────────────────────────────────────────────────────
 NO PII IN THE EVENT LOG, ON PURPOSE
@@ -88,13 +96,15 @@ Both files are written temp-then-rename, in the destination directory, with an
 fsync before the rename: a reader that catches a half-written file must get
 invalid JSON, not a partial number.
 
-DO NOT WRITE THESE INTO THE ACTIONS CHECKOUT. `--out` exists because the
-state-sync push step runs `git checkout state` and `git rm -rf .`; a modified
-tracked file under the checkout stops it switching branches, and the state DB
-then silently stops being persisted. The publish-telemetry composite action
-generates into a temp dir and commits with git plumbing for that reason. This
-is not hypothetical — it cost LDR-Automation-Clean sixteen hours of unpersisted
-state on 2026-08-11.
+DO NOT WRITE THESE INTO THE ACTIONS CHECKOUT. `--out` exists because the state
+push used to run `git checkout state` and `git rm -rf .`; a modified tracked
+file under the checkout stopped it switching branches, and the state DB then
+silently stopped being persisted. That cost LDR-Automation-Clean sixteen hours
+of unpersisted state on 2026-08-11. state_sync.py builds its commit with git
+plumbing now and does not care about the tree — but the publish-telemetry action
+still generates into a temp dir and commits the same way, because writing status
+files into a checkout that other steps read from is how that class of failure
+starts.
 """
 import argparse
 import datetime as dt
@@ -245,6 +255,16 @@ def _errored(section) -> bool:
     return isinstance(section, dict) and bool(section.get("error"))
 
 
+def _skipped_no_api_key(section) -> bool:
+    """True when a stage did nothing because its optional secret is unset.
+
+    Not a failure — unsetting FUB_API_KEY is how README says to get a manual
+    approval gate back — but not a zero either: the stage never looked. Its
+    counter is omitted and the stage is named in `incomplete_stages`.
+    """
+    return isinstance(section, dict) and bool(section.get("skipped_no_api_key"))
+
+
 def _count(section, key: str):
     """A real integer from a stage result, or None for 'we do not know'."""
     if not isinstance(section, dict) or section.get("error"):
@@ -328,7 +348,7 @@ def counters_from_run(stats: dict) -> tuple[dict, set]:
 
     fub = stats.get(STAGE_FUB)
     pushed = _count(fub, "pushed")
-    if pushed is None:
+    if pushed is None or _skipped_no_api_key(fub):
         if fub is not None:
             incomplete.add(STAGE_FUB)
     else:
@@ -441,6 +461,10 @@ def events_from_run(run: dict) -> list[dict]:
     fub = stats.get(STAGE_FUB)
     if _errored(fub):
         events.append(_event(ts, "failed", STAGE_FUB, f"FUB push failed: {fub['error']}"))
+    elif _skipped_no_api_key(fub):
+        # No event: the stage did not run, and "0 leads pushed to FUB" would
+        # read as a push that found nothing. incomplete_stages carries the fact.
+        pass
     else:
         pushed = _count(fub, "pushed")
         if pushed is not None:
