@@ -127,6 +127,54 @@ def test_a_stage_that_ran_and_found_nothing_publishes_a_counted_zero(db_path, tm
     assert today["leads_pushed_fub"] == 0
 
 
+def test_a_keyless_fub_push_is_not_reported_as_a_push_of_nothing(db_path, tmp_path):
+    """The disclosed gap, closed. With FUB_API_KEY unset, auto_push_leads pushes
+    nothing and reports `skipped_no_api_key` — the leads it left in
+    awaiting_approval. That is "we never looked", not "we looked and there was
+    nothing to do", so the counter is omitted and the stage is named incomplete.
+    """
+    stats = _healthy_stats()
+    stats["fub_push"] = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0,
+                         "skipped_no_api_key": 7}
+    _record(db_path, "weekly_pull", _at("2026-08-11"), stats)
+
+    today = _write(db_path, "2026-08-11", tmp_path / "out")["stats"]["today"]
+
+    assert "leads_pushed_fub" not in today, \
+        "a stage that never ran published a fabricated zero"
+    assert "fub_push" in today["incomplete_stages"]
+
+
+def test_a_push_that_had_nothing_to_push_still_publishes_its_zero(db_path, tmp_path):
+    """The other half of the same distinction: the key IS set, the stage ran, and
+    there were no leads awaiting. Zero is a fact, and the marker is 0."""
+    stats = _healthy_stats()
+    stats["fub_push"] = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0,
+                         "skipped_no_api_key": 0}
+    _record(db_path, "weekly_pull", _at("2026-08-11"), stats)
+
+    today = _write(db_path, "2026-08-11", tmp_path / "out")["stats"]["today"]
+
+    assert today["leads_pushed_fub"] == 0
+    assert "fub_push" not in today.get("incomplete_stages", [])
+
+
+def test_a_keyless_fub_push_produces_no_push_event(db_path, tmp_path):
+    """"0 leads pushed to FUB" in the event log reads as a push that found
+    nothing. A skipped stage says nothing at all — and it is not a failure
+    either: unsetting the key is how README describes getting a manual approval
+    gate back, and a daily "failed" event for a supported configuration is noise
+    that trains people to ignore the log."""
+    stats = _healthy_stats()
+    stats["fub_push"] = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0,
+                         "skipped_no_api_key": 7}
+    _record(db_path, "weekly_pull", _at("2026-08-11"), stats)
+
+    log = _write(db_path, "2026-08-11", tmp_path / "out")["log"]
+
+    assert not [e for e in log if e["stage"] == "fub_push"]
+
+
 def test_a_day_with_no_runs_is_empty_not_a_row_of_zeros(db_path, tmp_path):
     """'The cron did not fire' and 'the cron found nothing' are different facts."""
     _record(db_path, "daily_pull", _at("2026-08-11"), _healthy_stats())

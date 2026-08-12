@@ -220,6 +220,11 @@ for.
 **Fix.** The action checks the encrypted file and refuses to commit above 95 MB,
 so the last good state stays on the branch and the next run resumes from it.
 
+*Since:* the push moved out of shell and into `state_sync.push` when the
+concurrent-safe protocol was ported from LDR-Automation-Clean. The guard moved
+with it — same 95 MB, still ahead of the commit — and now has a test
+(`test_an_oversized_encrypted_db_is_refused_before_it_is_committed`).
+
 ## 8. Medium — provider consumer profiles stored and never read
 
 **Where:** `skiptrace/tracer.py`, `state.py`

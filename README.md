@@ -55,10 +55,25 @@ State is split across two SQLite files (GitHub rejects committed files over 100 
 
 | File | Contents | Lifecycle |
 |---|---|---|
-| `data/seller_finder.sqlite3` | Leads (qualified only), skip-trace cache, run history, divorce cases, deed dates, plus compact derived attributes: `owners_first_seen` (tenure baseline + owner-change detection for absentee parcels) and `exempt_parcels` (homestead diff snapshot) | AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern as LDR-Automation-Clean. Stays ~10 MB for two counties, well under 100 MB even at 5+ counties. A size guard runs in two places: `state.check_state_size()` fails the run at 90 MB, and the state-sync action **refuses to commit** an encrypted DB over 95 MB — the push step is `if: always()`, so the in-process guard alone could not stop a run that crashed before reaching it |
+| `data/seller_finder.sqlite3` | Leads (qualified only), skip-trace cache, run history, divorce cases, deed dates, plus compact derived attributes: `owners_first_seen` (tenure baseline + owner-change detection for absentee parcels) and `exempt_parcels` (homestead diff snapshot) | AES-256 encrypted and synced to the orphan `state` branch — the exact same pattern as LDR-Automation-Clean. Stays ~10 MB for two counties, well under 100 MB even at 5+ counties. A size guard runs in two places: `state.check_state_size()` fails the run at 90 MB, and the push itself (`state_sync.push`) **refuses to commit** an encrypted DB over 95 MB — the push step is `if: always()`, so the in-process guard alone could not stop a run that crashed before reaching it |
 | `data/parcels_cache.sqlite3` | The full raw parcel snapshot (`pc.parcels`) | **Ephemeral and gitignored** — rebuilt from the release mirror download on every weekly run and ATTACHed to the main connection, so cross-table joins work transparently. Never committed |
 
 Sub-threshold candidates (e.g. absentee-only at 30 points) are recomputed from the parcel cache each run and are *not* stored — only qualified leads (40+) persist. Opening a pre-split state DB triggers an automatic one-time migration that salvages the compact attributes, drops the heavy parcels table, and VACUUMs.
+
+#### The state push is compare-and-swap, and it never touches the working tree
+
+Ported from LDR-Automation-Clean (its issue #9, PRs #10 and #11). The sync used to pull the encrypted DB as a whole-file blob at job start and push a new whole-file blob at the end, by checking out the orphan `state` branch. Both halves of that were hazards, and both fired over there:
+
+- **No compare-and-swap.** A run that pulled before a sibling's push and finished after it silently discarded everything the sibling had written — and *both* pushes reported success.
+- **A checkout under the working tree.** `git checkout state` refuses over one modified tracked file, and the `|| git checkout --orphan state` fallback then dies with "a branch named 'state' already exists" under `bash -e`. Two workflows failed at that step for sixteen hours; every run afterwards recomputed the day from a DB that had never seen the work and published a confident zero.
+
+What runs now (`src/seller_finder/state_sync.py`, driven by `.github/actions/state-sync`):
+
+- **`pull`** records the *blob SHA* the DB was decrypted from, in `$RUNNER_TEMP` — never under the checkout. A pull that cannot reach a `state` branch which may exist **fails** instead of starting fresh: a run with an empty DB has no skip-trace cache and no lead statuses, so it would re-pay for owners already traced and re-push leads already in FUB.
+- **`push`** re-reads the branch; if the blob moved, it decrypts what is there and **merges it into this run's file** (`state_merge.py`), then builds its commit with the fetched tip as parent. Git's fast-forward check *is* the compare-and-swap: anything landing between the fetch and the push gets the push rejected, and the retry re-merges on top of the newer state. Out of attempts (6) the step **fails loudly**. There is no force push — overwriting the branch is the bug, not the recovery.
+- The commit is built with `git hash-object` / `write-tree` / `commit-tree` against a temporary index, exactly like `publish-telemetry`, so **HEAD, the current branch and the working tree are never touched**.
+
+`state_merge.py` holds one declared rule per table, and the ones that matter are the ones that cost money or leak data if they go the wrong way: a paid skip trace is never dropped and never mixed field-wise with the other lineage's result; a lead that reached FUB never looks unpushed again; `divorce_cases.match_attempts` (the cap on billable Claude calls) never regresses; `owners_first_seen` never invents tenure across an owner change; `exempt_parcels` never resurrects a row the newer pull dropped (that would be a false homestead-removed signal, +10 points, more spend); `ingested_files` never loses a row (a dropped row re-ingests a county CSV). **Surrogate ids are remapped, not copied** — the two lineages hand out `skip_traces.id` independently, so a copied id would attach one homeowner's lead to another homeowner's phone number. A table with no rule falls back to a union that cannot lose a row, and a test fails until someone adds the rule deliberately.
 
 Every run's job summary **opens with a health verdict** — either `✅ All pipeline stages healthy` or a list of the stages that failed — followed by a **Pipeline diagnostics** table (parcel rows/kept/absentee per county, foreclosure notices fetched/matched, scoring funnel, skip-trace and push outcomes).
 
@@ -199,6 +214,8 @@ LDR-Seller-Finder/
 │   ├── config.py                 # Env secrets + settings loader
 │   ├── arcgis.py                 # Shared ArcGIS client (200-with-error-body guard)
 │   ├── state.py                  # Split-DB SQLite schema, legacy migration, size guard
+│   ├── state_sync.py             # Encrypted state ⇄ `state` branch: compare-and-swap, no checkout
+│   ├── state_merge.py            # Per-table reconciliation when two runs overlap
 │   ├── scoring.py                # 0–100 scoring engine
 │   ├── fub.py                    # Follow Up Boss push: dedupe, tags, notes
 │   ├── review.py                 # Review CSV, run summary, weekly digest email
@@ -222,7 +239,9 @@ LDR-Seller-Finder/
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
 ├── tests/                        # Suite total is stated once, under Testing — and enforced
 │   ├── test_pipeline.py          # Core pipeline: scoring, budgets, dedupe, migrations
-│   └── test_telemetry.py         # Telemetry: absent≠zero, read-only, atomicity, no PII
+│   ├── test_telemetry.py         # Telemetry: absent≠zero, read-only, atomicity, no PII
+│   ├── test_state_sync.py        # The push protocol, against real git repos + openssl
+│   └── test_state_merge.py       # Per-table merge rules, both directions
 ├── status/                       # Published by the crons, read by LIFESTYLE ("THE FLOOR")
 │   ├── seller_stats.json         # Today's + yesterday's counters
 │   └── seller_log.json           # 100 most recent stage-level events
@@ -231,7 +250,7 @@ LDR-Seller-Finder/
     ├── workflows/daily-pull.yml      # Tue–Sat 6 AM CT cron (fast)
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
     ├── workflows/jarvis-build.yml    # `jarvis-build` label on an issue → Claude implements it → PR
-    ├── actions/state-sync/action.yml        # Encrypted SQLite ⇄ `state` branch
+    ├── actions/state-sync/action.yml        # Encrypted SQLite ⇄ `state` branch (wiring only; protocol in src/)
     └── actions/publish-telemetry/action.yml # status/*.json → main (never touches the working tree)
 ```
 
@@ -246,7 +265,7 @@ LDR-Seller-Finder/
 | **Push Approved Leads** | `workflow_dispatch` (manual fallback) | Retries `awaiting_approval` (failed pushes / runs before FUB key existed) and `held_no_contact` leads. Optional `exclude_ids` input skips specific leads. Supports `dry_run` |
 | **jarvis-build** | `jarvis-build` label applied to an issue | Hands the issue body to Claude Code as a build order; it implements the spec on a new branch and opens a PR. Ported from `lifestyle-brain`. **This costs money per run** — the label is the trigger, so applying it is the spend decision |
 
-Both cron workflows share the `ldr-seller-state` concurrency group, so a long weekly run can never race a daily run on the state DB.
+All three state-writing workflows share the `ldr-seller-state` concurrency group, so today a long weekly run queues behind — rather than races — a daily run or a manual push. That is defence in depth, not the guarantee: the state push itself is compare-and-swap with a row-level merge (see above), so an overlap survives whichever run lands second. Keeping both matters, because the group is one edit — a fourth workflow, a matrix job, a templated group — away from stopping being true.
 
 > **Editing workflow files:** all three workflows are live in `.github/workflows/`. A token without the `workflows` permission cannot push changes to them — if `git push` is rejected for that reason, edit the file through the GitHub web UI, or push with a PAT that carries the `workflow` scope. (The old workflows-pending staging directory and its install_workflows.sh helper were removed: the workflows have been installed since `2bf5f1d`, and running that installer would have copied the stale staged copies back over the live ones.)
 
@@ -267,7 +286,7 @@ Everything is derived from the `runs` table — the JSON blob `record_run()` alr
 
 Events are **stage-level and carry no PII** — county, stage and counts only. No owner names, addresses or phone numbers reach `status/`, for the same reason migration v5 purged stored consumer profiles.
 
-> **Ordering is load-bearing.** The `Publish telemetry` step must stay *ahead* of `Push state DB`: that step checks out the orphan `state` branch and runs `git rm -rf .`, which takes the decrypted DB with it. The publish action also never writes under the checkout — it generates into a temp dir and commits with git plumbing — because a modified tracked file stops `git checkout state` from switching branches, and the state DB then silently stops being persisted. That exact failure cost the sibling repo sixteen hours of lost state on 2026-08-11.
+> **Step order is now preference, not a constraint.** `Publish telemetry` still runs *ahead* of `Push state DB`, and should: it reads the decrypted DB, and running it first keeps the published numbers and the pushed state from the same moment. But the push no longer checks out the `state` branch or runs `git rm -rf .`, so it no longer takes the decrypted DB with it. Both steps also refuse to write under the checkout — they generate into a temp dir and commit with git plumbing — because a modified tracked file used to stop `git checkout state` from switching branches, and the state DB then silently stopped being persisted. That exact failure cost the sibling repo sixteen hours of lost state on 2026-08-11; the mechanism is gone from here, and `tests/test_state_sync.py` keeps it gone.
 
 ### The auto-push flow, step by step
 
@@ -386,7 +405,7 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 - **Public records only.** Every automated source is a government-published dataset or service: TxGIO StratMap (CC0), Bexar County ArcGIS services, and County Clerk foreclosure postings (Texas Property Code §51.002 requires public posting). No Zillow, Realtor.com, or other ToS-violating scraping — the county-first approach exists precisely to avoid that.
 - **No automated outreach from this repo.** It writes to FUB (tags + notes) and emails *you* a digest. Contacting leads happens in LDR-Automation-Clean under its CAN-SPAM/unsubscribe rules.
-- **Automated push, reviewable after the fact.** Qualified, contactable leads are **auto-pushed to FUB at the end of every run** — there is no approval gate in front of it (that gate was removed in commit `fed9e8f`). What you get instead is a complete record: the `pending-leads` artifact lists every lead pushed, held, or awaiting retry, and the Monday digest carries the same counts. Use the **Push Approved Leads** workflow's `exclude_ids` input to suppress specific leads on a retry. If you want a true human gate, unset `FUB_API_KEY` on the cron workflows — leads then accumulate in `awaiting_approval` and only the manual workflow pushes them.
+- **Automated push, reviewable after the fact.** Qualified, contactable leads are **auto-pushed to FUB at the end of every run** — there is no approval gate in front of it (that gate was removed in commit `fed9e8f`). What you get instead is a complete record: the `pending-leads` artifact lists every lead pushed, held, or awaiting retry, and the Monday digest carries the same counts. Use the **Push Approved Leads** workflow's `exclude_ids` input to suppress specific leads on a retry. If you want a true human gate, unset `FUB_API_KEY` on the cron workflows — leads then accumulate in `awaiting_approval` and only the manual workflow pushes them. A run in that configuration reports `fub_push.skipped_no_api_key` (how many leads it left waiting), says so in the diagnostics table, and publishes **no** `leads_pushed_fub` counter rather than a zero: "we never looked" and "we looked and there was nothing to push" are different facts, and only the second one deserves a zero.
 - **TCPA awareness.** DNC and litigator flags from skip tracing are stored and surfaced in the review CSV. If you cold-call, scrub against the federal DNC registry; TCPA-restricted numbers are excluded by the provider by default.
 - **Privacy / data minimisation.** Owner data stays inside the AES-256 encrypted state DB on the `state` branch. The review CSV — which does contain owner names, property addresses, emails and phones — lives only in Actions artifacts, retained **30 days (weekly) / 14 days (daily)**, then deleted by GitHub. The skip-trace cache stores only what the pipeline uses (emails, phones, DNC/litigator flags) plus a non-identifying provenance stub; the provider's full consumer profile (relatives, address history, DOB) is **never stored** — see migration v5. Secrets are never logged: failures log HTTP status and response body, never the key.
 
@@ -396,10 +415,11 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ```bash
 pip install -r requirements.txt pytest
-python3 -m pytest tests/ -v          # 147 unit tests (scoring, warm tier, budgets, dedupe,
+python3 -m pytest tests/ -v          # 235 unit tests (scoring, warm tier, budgets, dedupe,
                                      # idempotency, migrations, feed/API error discipline,
                                      # PII minimisation, entry-point imports, telemetry
-                                     # honesty/atomicity)
+                                     # honesty/atomicity, and the state push: overlapping
+                                     # writers, per-table merge rules, no checkout, no force)
 DRY_RUN=true python3 scripts/e2e_live_test.py   # live smoke test, zero spend
 ```
 

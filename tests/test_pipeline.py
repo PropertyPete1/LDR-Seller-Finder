@@ -709,7 +709,62 @@ def test_auto_push_skipped_without_fub_key(db, monkeypatch):
     monkeypatch.setattr(config, "FUB_API_KEY", "")
     stats = fub.auto_push_leads(db)
     assert stats["pushed"] == 0 and stats["total"] == 0
+    assert stats["skipped_no_api_key"] == 1, \
+        "the leads left waiting are the fact that distinguishes this from a no-op run"
     assert db.execute("SELECT status FROM leads WHERE prop_id='7003'").fetchone()["status"] == "awaiting_approval"
+
+
+def test_a_keyless_auto_push_is_distinguishable_from_having_nothing_to_push(db, monkeypatch):
+    """Both runs push zero leads. Only one of them looked.
+
+    Without the marker both returned the same all-zero dict, and telemetry
+    published `leads_pushed_fub: 0` either way — true, and reading like the wrong
+    fact. The tracer has reported a missing BATCHDATA_API_KEY this way all along.
+    """
+    from seller_finder import fub
+    _make_awaiting_lead(db, "7005", emails='["a@b.com"]')
+    _make_awaiting_lead(db, "7006", emails='["c@d.com"]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "")
+
+    keyless = fub.auto_push_leads(db)
+    assert keyless["skipped_no_api_key"] == 2
+
+    # Same DB, key present, nothing left awaiting: a real, counted zero.
+    db.execute("UPDATE leads SET status='pushed' WHERE status='awaiting_approval'")
+    db.commit()
+    monkeypatch.setattr(config, "FUB_API_KEY", "fake")
+    nothing_to_do = fub.auto_push_leads(db)
+    assert nothing_to_do["skipped_no_api_key"] == 0 and nothing_to_do["total"] == 0
+    assert keyless != nothing_to_do
+
+
+def test_a_keyless_auto_push_is_not_a_run_failure(db, monkeypatch):
+    """Unsetting FUB_API_KEY is how README says to get a manual approval gate
+    back. It must be reported, not paged: collect_stage_errors is what flips the
+    dead-man's switch to DOWN."""
+    from seller_finder import fub
+    from seller_finder.health import collect_stage_errors
+    _make_awaiting_lead(db, "7007", emails='["a@b.com"]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "")
+    stats = fub.auto_push_leads(db)
+    assert collect_stage_errors({"fub_push": stats}) == []
+
+
+def test_the_diagnostics_table_says_the_push_was_skipped_not_empty(db, monkeypatch):
+    """The review artifact is the permanent record of a run. "pushed 0" there
+    reads as "nothing to push"; the difference is whether N leads are sitting in
+    awaiting_approval waiting for a secret."""
+    from seller_finder import fub, review
+    _make_awaiting_lead(db, "7008", emails='["a@b.com"]')
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "FUB_API_KEY", "")
+    stats = fub.auto_push_leads(db)
+
+    table = "\n".join(review._diagnostics_md({"fub_push": stats}))
+    assert "SKIPPED" in table and "FUB_API_KEY" in table
+    assert "1 lead(s) left in awaiting_approval" in table
 
 
 def test_dnc_flag_adds_dnc_tag(db, monkeypatch):

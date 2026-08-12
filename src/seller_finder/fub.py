@@ -286,11 +286,31 @@ def _push_batch(conn, leads, stats: dict) -> dict:
 
 
 def auto_push_leads(conn) -> dict:
-    """Auto-push all awaiting leads at the end of the weekly run."""
-    stats = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0}
+    """Auto-push all awaiting leads at the end of the weekly run.
+
+    OPTIONAL SECRET: if FUB_API_KEY is not configured the push is skipped
+    entirely and the leads keep status 'awaiting_approval'
+    (stats["skipped_no_api_key"] reports how many were left waiting), the same
+    way the tracer reports a missing BATCHDATA_API_KEY.
+
+    That marker is the difference between "we looked and there was nothing to
+    push" and "we never looked". Without it both cases returned pushed=0 and
+    telemetry published a counted zero for `leads_pushed_fub` — a true
+    statement that read like the wrong fact. Unsetting FUB_API_KEY is a
+    SUPPORTED configuration (it is how README describes getting a manual
+    approval gate back), so this is not an error and does not fail the run; it
+    is reported, and telemetry omits the counter rather than publishing a zero.
+    """
+    stats = {"pushed": 0, "held_no_contact": 0, "failed": 0, "total": 0,
+             "skipped_no_api_key": 0}
     if not config.FUB_API_KEY:
-        LOGGER.warning("FUB_API_KEY not set — auto-push SKIPPED; leads stay in "
-                       "awaiting_approval for the push-approved fallback workflow.")
+        awaiting = conn.execute(
+            "SELECT COUNT(*) c FROM leads WHERE status='awaiting_approval'"
+        ).fetchone()["c"]
+        stats["skipped_no_api_key"] = awaiting
+        LOGGER.warning("FUB_API_KEY not set — auto-push SKIPPED for %d lead(s); they "
+                       "stay in awaiting_approval for the push-approved fallback "
+                       "workflow.", awaiting)
         return stats
     leads = conn.execute(
         "SELECT * FROM leads WHERE status='awaiting_approval' ORDER BY score DESC"
