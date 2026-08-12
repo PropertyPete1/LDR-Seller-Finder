@@ -203,6 +203,7 @@ LDR-Seller-Finder/
 │   ├── fub.py                    # Follow Up Boss push: dedupe, tags, notes
 │   ├── review.py                 # Review CSV, run summary, weekly digest email
 │   ├── health.py                 # Dead-man's switch + run health verdict
+│   ├── telemetry.py              # status/*.json writer for THE FLOOR (read-only, never fails a run)
 │   ├── sources/
 │   │   ├── parcels.py            # TxGIO bulk parcel loader (mirror-first, light sync on daily)
 │   │   ├── exemptions.py         # Bexar homestead exemptions + removal detection
@@ -219,12 +220,19 @@ LDR-Seller-Finder/
 │   │                             #   POSIX sh-compatible, works on macOS bash 3.2)
 │   ├── e2e_live_test.py          # Live smoke test (dry-run, no spend)
 │   └── live_bexar_test.py        # Full live Bexar E2E (real parcels + foreclosures)
-├── tests/test_pipeline.py        # 115 unit tests
+├── tests/                        # Suite total is stated once, under Testing — and enforced
+│   ├── test_pipeline.py          # Core pipeline: scoring, budgets, dedupe, migrations
+│   └── test_telemetry.py         # Telemetry: absent≠zero, read-only, atomicity, no PII
+├── status/                       # Published by the crons, read by LIFESTYLE ("THE FLOOR")
+│   ├── seller_stats.json         # Today's + yesterday's counters
+│   └── seller_log.json           # 100 most recent stage-level events
 └── .github/
     ├── workflows/weekly-pull.yml     # Mon 6 AM CT cron (full)
     ├── workflows/daily-pull.yml      # Tue–Sat 6 AM CT cron (fast)
     ├── workflows/push-approved.yml   # Manual fallback (retry failed/held pushes)
-    └── actions/state-sync/action.yml # Encrypted SQLite ⇄ `state` branch
+    ├── workflows/jarvis-build.yml    # `jarvis-build` label on an issue → Claude implements it → PR
+    ├── actions/state-sync/action.yml        # Encrypted SQLite ⇄ `state` branch
+    └── actions/publish-telemetry/action.yml # status/*.json → main (never touches the working tree)
 ```
 
 ---
@@ -236,12 +244,30 @@ LDR-Seller-Finder/
 | **Weekly Data Pull** | Cron `0 11 * * 1` (Mon 6:00 AM CDT) + manual | Full pipeline **including auto-push to FUB**. Uploads `pending-leads` artifact (permanent push record: pushed / held / awaiting-retry), writes the job summary, emails the digest, pings healthchecks.io |
 | **Daily Data Pull** | Cron `0 11 * * 2-6` (Tue–Sat 6:00 AM CDT) + manual | Fast path: light parcel sync from the mirror (owner-change bookkeeping skipped when the mirror asset is unchanged), new pre-foreclosure notices, scoring, tracing (15-trace budget), auto-push. Same state DB, healthcheck, and diagnostics table; no digest email |
 | **Push Approved Leads** | `workflow_dispatch` (manual fallback) | Retries `awaiting_approval` (failed pushes / runs before FUB key existed) and `held_no_contact` leads. Optional `exclude_ids` input skips specific leads. Supports `dry_run` |
+| **jarvis-build** | `jarvis-build` label applied to an issue | Hands the issue body to Claude Code as a build order; it implements the spec on a new branch and opens a PR. Ported from `lifestyle-brain`. **This costs money per run** — the label is the trigger, so applying it is the spend decision |
 
 Both cron workflows share the `ldr-seller-state` concurrency group, so a long weekly run can never race a daily run on the state DB.
 
 > **Editing workflow files:** all three workflows are live in `.github/workflows/`. A token without the `workflows` permission cannot push changes to them — if `git push` is rejected for that reason, edit the file through the GitHub web UI, or push with a PAT that carries the `workflow` scope. (The old workflows-pending staging directory and its install_workflows.sh helper were removed: the workflows have been installed since `2bf5f1d`, and running that installer would have copied the stale staged copies back over the live ones.)
 
 > **DST note:** GitHub cron is UTC-only. `0 11` = 6:00 AM CDT (summer). When daylight saving ends in November, change to `0 12` to stay at 6:00 AM CST.
+
+### Telemetry — what the crons publish about themselves
+
+Both scheduled runs end by publishing two files to `main` for LIFESTYLE ("THE FLOOR"):
+
+| File | Contents |
+|---|---|
+| `status/seller_stats.json` | Today's and yesterday's counters: `parcels_scanned`, `preforeclosure_notices`, `preforeclosure_matches`, `leads_scored`, `leads_qualified`, `skip_traces`, `leads_pushed_fub` |
+| `status/seller_log.json` | The 100 most recent stage-level events (`scanned`, `matched`, `scored`, `traced`, `pushed`, `failed`) |
+
+Everything is derived from the `runs` table — the JSON blob `record_run()` already writes at the end of every run — through a **read-only** (`mode=ro`) connection, so telemetry cannot touch the state the next run resumes from.
+
+**A missing key means "we don't know", never zero.** Every stage in the runners stores `{"error": ...}` instead of its counts when it fails, and a stage that errored publishes *no* counter rather than a `0` — a blocked parcel mirror must not read as "scanned 0 parcels". A day whose stages did not all report lists them in `incomplete_stages`, and the totals beside it are a floor, not a total. A day with no runs at all publishes `{}`, because "the cron did not fire" and "the cron found nothing" are different facts.
+
+Events are **stage-level and carry no PII** — county, stage and counts only. No owner names, addresses or phone numbers reach `status/`, for the same reason migration v5 purged stored consumer profiles.
+
+> **Ordering is load-bearing.** The `Publish telemetry` step must stay *ahead* of `Push state DB`: that step checks out the orphan `state` branch and runs `git rm -rf .`, which takes the decrypted DB with it. The publish action also never writes under the checkout — it generates into a temp dir and commits with git plumbing — because a modified tracked file stops `git checkout state` from switching branches, and the state DB then silently stops being persisted. That exact failure cost the sibling repo sixteen hours of lost state on 2026-08-11.
 
 ### The auto-push flow, step by step
 
@@ -370,9 +396,10 @@ Trigger **Weekly Data Pull** manually with `dry_run: true` once to verify data s
 
 ```bash
 pip install -r requirements.txt pytest
-python3 -m pytest tests/ -v          # 115 unit tests (scoring, warm tier, budgets, dedupe,
+python3 -m pytest tests/ -v          # 147 unit tests (scoring, warm tier, budgets, dedupe,
                                      # idempotency, migrations, feed/API error discipline,
-                                     # PII minimisation, entry-point imports)
+                                     # PII minimisation, entry-point imports, telemetry
+                                     # honesty/atomicity)
 DRY_RUN=true python3 scripts/e2e_live_test.py   # live smoke test, zero spend
 ```
 
