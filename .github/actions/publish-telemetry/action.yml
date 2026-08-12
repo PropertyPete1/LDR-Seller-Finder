@@ -1,0 +1,146 @@
+name: "Publish Seller Telemetry to THE FLOOR"
+description: "Regenerate status/*.json from the state DB and commit them straight to main"
+
+# Run this with `if: always()`, and BEFORE the 'Push state DB' step.
+#
+# ── ORDERING IS LOAD-BEARING ────────────────────────────────────────────────
+# state-sync's push step runs `git checkout state` and then `git rm -rf .`.
+# After it, the working tree is on the orphan state branch and
+# data/seller_finder.sqlite3 is gone. Telemetry reads that file, so it has to
+# run first. Putting this step after the state push does not produce worse
+# numbers — it produces no numbers at all.
+#
+# ── THIS STEP MUST LEAVE THE WORKING TREE EXACTLY AS IT FOUND IT ────────────
+# That is not tidiness. In the sibling repo (LDR-Automation-Clean) the first
+# version of this action wrote status/*.json into the working tree. Once the
+# first telemetry commit made status/ a TRACKED path on main, every later run
+# left modified tracked files behind, and the state-sync push step could no
+# longer switch branches: `git checkout state` refuses over dirty tracked
+# files, and the `|| git checkout --orphan state` fallback then dies with
+# "a branch named 'state' already exists" under `bash -e`. Two workflows
+# failed at that step for sixteen hours. The bots kept running; none of their
+# state was ever persisted; and every later run recomputed the day from a DB
+# that had never seen the work and published a confident zero.
+#
+# THIS REPO STILL HAS THAT EXACT state-sync PUSH STEP. The fix that made the
+# sibling's push stop checking out branches has not been ported here, so the
+# hazard is live, not historical.
+#
+# So: generate into a temp directory, build the commit with plumbing against a
+# temporary index, and restore status/ on the way out. HEAD, the branch and the
+# working tree are never touched.
+
+inputs:
+  github_token:
+    description: "Token used to push the status commit to main"
+    required: true
+  database_path:
+    description: "Decrypted state DB, relative to the repo root"
+    required: false
+    default: "data/seller_finder.sqlite3"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Publish seller telemetry
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        DATABASE_PATH: ${{ inputs.database_path }}
+      run: |
+        # Composite `shell: bash` starts with -e already set — that is exactly
+        # how the sibling's state-sync step turned one git error into a failed
+        # job. Turn it OFF deliberately: below, a non-zero exit from the writer
+        # is DATA ("there was nothing to report"), and it has to be read, not
+        # thrown. Nothing in this step may fail the run.
+        set +e
+        set -uo pipefail
+
+        db="${DATABASE_PATH}"
+        if [ ! -f "$db" ]; then
+          echo "⚠️  No state DB at $db — nothing to report."
+          exit 0
+        fi
+
+        # Everything happens here. Nothing is written under the checkout.
+        out="$(mktemp -d)"
+        trap 'rm -rf "$out"' EXIT
+
+        # The commit is always built on the CURRENT main, never on the SHA
+        # actions/checkout pinned this job to. The daily and weekly crons can
+        # overlap a manual dispatch, and a queued job's pinned SHA is stale the
+        # moment a sibling pushes.
+        git fetch -q origin main || true
+
+        # Seed the temp dir from what main already publishes. seller_log is a
+        # MERGE, not an append: the on-disk file is the long memory that
+        # outlives the 400-row window the writer reads out of the runs table.
+        # Seeding from origin/main rather than the local checkout also picks up
+        # entries a sibling published while this job was running.
+        git show "FETCH_HEAD:status/seller_log.json" > "$out/seller_log.json" 2>/dev/null || true
+
+        PYTHONPATH=src python3 -m seller_finder.telemetry --db "$db" --out "$out"
+        rc=$?
+
+        if [ "$rc" -ne 0 ] || [ ! -f "$out/seller_stats.json" ] || [ ! -f "$out/seller_log.json" ]; then
+          echo "⚠️  Status files were not written (rc=$rc) — nothing to commit."
+          exit 0
+        fi
+
+        # Both files must parse before they reach main. LIFESTYLE has no
+        # fallback for malformed JSON.
+        for f in "$out/seller_stats.json" "$out/seller_log.json"; do
+          if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"; then
+            echo "❌ $(basename "$f") is not valid JSON — refusing to commit."
+            exit 0
+          fi
+        done
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        stamp="$(python3 -c "import json;print(json.load(open('$out/seller_stats.json'))['date'])")"
+
+        published=0
+        for attempt in 1 2 3; do
+          git fetch -q origin main || true
+          base="$(git rev-parse FETCH_HEAD)"
+
+          index="$(mktemp)"
+          GIT_INDEX_FILE="$index" git read-tree "$base"
+          for name in seller_stats.json seller_log.json; do
+            blob="$(git hash-object -w "$out/$name")"
+            GIT_INDEX_FILE="$index" git update-index --add \
+              --cacheinfo "100644,$blob,status/$name"
+          done
+          tree="$(GIT_INDEX_FILE="$index" git write-tree)"
+          rm -f "$index"
+
+          if [ "$tree" = "$(git rev-parse "${base}^{tree}")" ]; then
+            echo "✅ Telemetry unchanged — nothing to commit."
+            published=1
+            break
+          fi
+
+          commit="$(git commit-tree "$tree" -p "$base" -m "status: seller telemetry for ${stamp}")"
+          if git push origin "${commit}:main"; then
+            echo "✅ Telemetry published to main (attempt $attempt): $commit"
+            published=1
+            break
+          fi
+          echo "⚠️  Push rejected (attempt $attempt) — someone pushed to main; rebuilding on the new tip..."
+        done
+
+        # Belt and braces. Nothing above writes under the checkout, but leaving
+        # a single modified tracked file here is what broke state persistence
+        # for sixteen hours in the sibling repo, so the tree is put back before
+        # this step ends, whatever happened.
+        git checkout -- status/ 2>/dev/null || true
+        git clean -fdq status/ 2>/dev/null || true
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::warning::Working tree is not clean after publishing telemetry — the state DB push may fail:"
+          git status --porcelain
+        fi
+
+        if [ "$published" -ne 1 ]; then
+          echo "⚠️  Could not publish telemetry after 3 attempts — the next run will retry."
+        fi

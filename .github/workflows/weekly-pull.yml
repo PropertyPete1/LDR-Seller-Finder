@@ -68,6 +68,15 @@ jobs:
           if [ -f review/run_summary.md ]; then
             cat review/run_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+      # MUST stay ahead of 'Push state DB': that step checks out the orphan
+      # `state` branch and runs `git rm -rf .`, which takes the decrypted DB
+      # this reads with it.
+      - name: Publish telemetry
+        if: always()
+        uses: ./.github/actions/publish-telemetry
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          database_path: ${{ env.DATABASE_PATH }}
       - name: Push state DB
         if: always()
         uses: ./.github/actions/state-sync
