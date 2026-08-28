@@ -1,5 +1,5 @@
 {
-  "date": "2026-08-27",
+  "date": "2026-08-28",
   "today": {
     "parcels_scanned": 920439,
     "preforeclosure_notices": 435,
@@ -18,9 +18,9 @@
     "skip_traces": 0,
     "leads_pushed_fub": 0
   },
-  "last_run_iso": "2026-08-27T21:00:41Z",
+  "last_run_iso": "2026-08-28T21:23:54Z",
   "last_run_type": "daily_pull",
-  "last_run_finished_iso": "2026-08-27T21:00:40Z",
+  "last_run_finished_iso": "2026-08-28T21:23:52Z",
   "dry_run": false,
-  "yesterday_date": "2026-08-26"
+  "yesterday_date": "2026-08-27"
 }
