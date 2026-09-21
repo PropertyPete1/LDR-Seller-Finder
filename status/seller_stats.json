@@ -1,5 +1,5 @@
 {
-  "date": "2026-09-19",
+  "date": "2026-09-21",
   "today": {
     "parcels_scanned": 920439,
     "preforeclosure_notices": 566,
@@ -9,18 +9,10 @@
     "skip_traces": 0,
     "leads_pushed_fub": 0
   },
-  "yesterday": {
-    "parcels_scanned": 920439,
-    "preforeclosure_notices": 566,
-    "preforeclosure_matches": 424,
-    "leads_scored": 213645,
-    "leads_qualified": 179,
-    "skip_traces": 0,
-    "leads_pushed_fub": 0
-  },
-  "last_run_iso": "2026-09-19T14:17:22Z",
-  "last_run_type": "daily_pull",
-  "last_run_finished_iso": "2026-09-19T14:17:20Z",
+  "yesterday": {},
+  "last_run_iso": "2026-09-21T16:53:31Z",
+  "last_run_type": "weekly_pull",
+  "last_run_finished_iso": "2026-09-21T16:53:29Z",
   "dry_run": false,
-  "yesterday_date": "2026-09-18"
+  "yesterday_date": "2026-09-20"
 }
