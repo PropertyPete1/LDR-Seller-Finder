@@ -1,5 +1,71 @@
 [
   {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "traced",
+    "stage": "skiptrace",
+    "detail": "0 skip-traces, 0 matched"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "scored",
+    "stage": "scoring",
+    "detail": "213645 leads scored, 179 qualified"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "scanned",
+    "stage": "parcels",
+    "detail": "253488 parcels scanned, 35793 absentee",
+    "county": "travis"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "scanned",
+    "stage": "parcels",
+    "detail": "82353 parcels scanned, 29643 absentee",
+    "county": "comal"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "scanned",
+    "stage": "parcels",
+    "detail": "584598 parcels scanned, 149017 absentee",
+    "county": "bexar"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "pushed",
+    "stage": "fub_push",
+    "detail": "0 leads pushed to FUB"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "matched",
+    "stage": "preforeclosure",
+    "detail": "0 pre-foreclosure matches from 0 notices",
+    "county": "travis"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "matched",
+    "stage": "preforeclosure",
+    "detail": "0 pre-foreclosure matches from 0 notices",
+    "county": "comal"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "matched",
+    "stage": "preforeclosure",
+    "detail": "424 pre-foreclosure matches from 566 notices",
+    "county": "bexar"
+  },
+  {
+    "ts": "2026-09-23T15:25:37Z",
+    "type": "failed",
+    "stage": "run",
+    "detail": "daily_pull finished with failed stage(s): skiptrace-all-errors"
+  },
+  {
     "ts": "2026-09-22T15:38:59Z",
     "type": "traced",
     "stage": "skiptrace",
@@ -589,72 +655,6 @@
   },
   {
     "ts": "2026-09-12T13:59:44Z",
-    "type": "failed",
-    "stage": "run",
-    "detail": "daily_pull finished with failed stage(s): skiptrace-all-errors"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "traced",
-    "stage": "skiptrace",
-    "detail": "0 skip-traces, 0 matched"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "scored",
-    "stage": "scoring",
-    "detail": "213548 leads scored, 156 qualified"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "scanned",
-    "stage": "parcels",
-    "detail": "253488 parcels scanned, 35793 absentee",
-    "county": "travis"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "scanned",
-    "stage": "parcels",
-    "detail": "82353 parcels scanned, 29643 absentee",
-    "county": "comal"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "scanned",
-    "stage": "parcels",
-    "detail": "584598 parcels scanned, 149017 absentee",
-    "county": "bexar"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "pushed",
-    "stage": "fub_push",
-    "detail": "0 leads pushed to FUB"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "matched",
-    "stage": "preforeclosure",
-    "detail": "0 pre-foreclosure matches from 0 notices",
-    "county": "travis"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "matched",
-    "stage": "preforeclosure",
-    "detail": "0 pre-foreclosure matches from 0 notices",
-    "county": "comal"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
-    "type": "matched",
-    "stage": "preforeclosure",
-    "detail": "297 pre-foreclosure matches from 361 notices",
-    "county": "bexar"
-  },
-  {
-    "ts": "2026-09-11T14:59:06Z",
     "type": "failed",
     "stage": "run",
     "detail": "daily_pull finished with failed stage(s): skiptrace-all-errors"
